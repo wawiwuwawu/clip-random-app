@@ -434,28 +434,10 @@ class FFmpegEngine:
         encoder: str,
     ) -> bool:
         """
-        Concatenate a list of clips into a single video file using ffmpeg's
-        concat demuxer and the requested encoder.
-
-        Parameters
-        ----------
-        clip_paths : list[str]
-            Ordered list of clip file paths to concatenate.
-        output_path : str
-            Destination path for the final video.
-        encoder : str
-            One of ``"nvenc"``, ``"qsv"``, ``"amf"``, or ``"cpu"``.
-
-        Returns
-        -------
-        bool
-            ``True`` on success, ``False`` on failure.
+        Concatenate clips using ffmpeg's concat filter (filter_complex).
+        Each clip is decoded independently, scaled to a common resolution,
+        then concatenated at the frame level — zero PTS discontinuity.
         """
-        # ---- Map short name to encoder + extra args ---------------------
-        # Each entry includes codec name and full argument list (preset,
-        # rate-control, quality flags).  Do NOT add universal flags like
-        # ``-preset fast`` or ``-b:v 5M`` — those are libx264-specific and
-        # will crash NVENC/QSV/AMF.
         encoder_map: dict[str, dict] = {
             "nvenc": {
                 "codec": "h264_nvenc",
@@ -477,51 +459,70 @@ class FFmpegEngine:
 
         enc_info = encoder_map.get(encoder.lower())
         if enc_info is None:
-            self._log(f"Unknown encoder \"{encoder}\". Falling back to libx264.")
+            self._log(f'Unknown encoder "{encoder}". Falling back to libx264.')
             enc_info = encoder_map["cpu"]
 
-        # ---- Create concat list file ------------------------------------
+        # --- Probe resolution of first clip as target ---
         try:
-            fd, concat_list_path = tempfile.mkstemp(
-                suffix=".txt", prefix="concat_list_", text=True
+            r = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height",
+                    "-of", "csv=s=x:p=0",
+                    clip_paths[0],
+                ],
+                capture_output=True, text=True, check=True,
             )
-            with os.fdopen(fd, "w") as f:
-                for clip_path in clip_paths:
-                    # Use absolute paths and escape single quotes for the demuxer
-                    escaped = clip_path.replace("'", "'\\''")
-                    f.write(f"file '{escaped}'\n")
-        except OSError as exc:
-            self._log(f"Failed to create concat list file: {exc}")
-            return False
+            target_w, target_h = r.stdout.strip().split("x")
+        except Exception:
+            target_w, target_h = "1920", "1080"
 
-        # ---- Helper to run (and retry) concat ---------------------------
-        def _run_concat(codec: str, extra_args: list[str], attempt_label: str) -> bool:
-            """Build and run the concat command with *codec* + *extra_args*."""
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-fflags", "+genpts",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list_path,
+        n = len(clip_paths)
+
+        # --- Build filter_complex ---
+        filter_lines = []
+        for i in range(n):
+            # Scale each clip to target resolution with letterbox + square pixels
+            filter_lines.append(
+                f"[{i}:v]scale={target_w}:{target_h}"
+                f":force_original_aspect_ratio=decrease"
+                f",pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+                f",setsar=1[v{i}]"
+            )
+
+        concat_v = "".join(f"[v{i}]" for i in range(n))
+        concat_a = "".join(f"[{i}:a]" for i in range(n))
+        filter_lines.append(
+            f"{concat_v}{concat_a}concat=n={n}:v=1:a=1[outv][outa]"
+        )
+
+        filter_complex = ";".join(filter_lines)
+
+        # --- Run concat ---
+        def _run_concat(codec: str, extra_args: list[str], label: str) -> bool:
+            cmd = ["ffmpeg", "-y"]
+            for clip in clip_paths:
+                cmd.extend(["-i", clip])
+            cmd.extend([
+                "-filter_complex", filter_complex,
+                "-map", "[outv]",
+                "-map", "[outa]",
                 "-c:v", codec,
                 *extra_args,
                 "-c:a", "aac",
                 "-b:a", "128k",
                 "-pix_fmt", "yuv420p",
-                "-vsync", "cfr",
-                "-max_muxing_queue_size", "9999",
                 output_path,
-            ]
-            cmd_str = " ".join(str(c) for c in cmd)
-            self._log(f"Concatenating clips ({attempt_label}): {cmd_str}")
+            ])
+            self._log(f"Concatenating clips ({label}): {' '.join(str(c) for c in cmd[:6])}...")
 
             try:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
                 return True
             except subprocess.CalledProcessError as exc:
-                self._log(f"Concatenation failed ({attempt_label}): {exc}")
+                self._log(f"Concatenation failed ({label}): {exc}")
                 if exc.stderr:
                     self._log(f"FFmpeg stderr: {exc.stderr[:500]}")
                 return False
@@ -529,26 +530,17 @@ class FFmpegEngine:
                 self._log("ffmpeg binary not found on PATH")
                 return False
 
-        # ---- Attempt 1: requested encoder -------------------------------
+        # --- Attempt 1: requested encoder ---
         is_gpu = encoder.lower() in ("nvenc", "qsv", "amf")
-        success = _run_concat(enc_info["codec"], enc_info["args"],
-                               attempt_label=encoder.lower())
+        success = _run_concat(enc_info["codec"], enc_info["args"], encoder.lower())
 
-        # ---- Attempt 2: GPU → CPU fallback -------------------------------
+        # --- Attempt 2: GPU -> CPU fallback ---
         if not success and is_gpu:
             self._log("GPU encoding failed — falling back to CPU (libx264)...")
             cpu_info = encoder_map["cpu"]
-            success = _run_concat(cpu_info["codec"], cpu_info["args"],
-                                   attempt_label="cpu (fallback)")
+            success = _run_concat(cpu_info["codec"], cpu_info["args"], "cpu (fallback)")
 
-        try:
-            return success
-        finally:
-            # Clean up the temporary concat list
-            try:
-                os.unlink(concat_list_path)
-            except OSError:
-                pass
+        return success
 
     # ------------------------------------------------------------------
     def concat_audio_clips(
