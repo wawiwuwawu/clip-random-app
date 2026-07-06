@@ -122,7 +122,6 @@ class MainWindow(QMainWindow):
     clip_duration_spin: QSpinBox
     encoder_combo: QComboBox
     silence_encoder_combo: QComboBox
-    skip_silence_check: QCheckBox
     silence_file_edit: QLineEdit
     silence_drop_zone: DropZone
     threshold_spin: QSpinBox
@@ -136,7 +135,7 @@ class MainWindow(QMainWindow):
     log_console: QPlainTextEdit
 
     # Public signals
-    compilation_requested = Signal(str, str, int, int, str, bool)
+    compilation_requested = Signal(str, str, int, int, str)
     silence_removal_requested = Signal(str, str, str, int, float, float)
     cancellation_requested = Signal()
 
@@ -414,18 +413,12 @@ class MainWindow(QMainWindow):
         self.encoder_combo.setFixedWidth(260)
         self.encoder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.skip_silence_check = QCheckBox("Skip silence detection (use full video)")
-        self.skip_silence_check.setToolTip(
-            "When checked, clips are taken from the entire video without analyzing audio"
-        )
-
         settings_grid.addWidget(total_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.total_duration_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(clip_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.clip_duration_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(encoder_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.encoder_combo, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        settings_grid.addWidget(self.skip_silence_check, 3, 0, 1, 2)
         settings_layout.addLayout(settings_grid)
         layout.addWidget(settings_card)
 
@@ -1113,8 +1106,6 @@ class MainWindow(QMainWindow):
         total_dur_seconds = self.total_duration_spin.value() * 60
         clip_dur = self.clip_duration_spin.value()
         encoder = self.encoder_combo.currentText()
-        skip_silence = self.skip_silence_check.isChecked()
-
         if encoder == "Auto (Detect)":
             encoder = self._detect_gpu_encoder_display()
             self.append_log(f"Auto-detected encoder: {encoder}")
@@ -1131,7 +1122,7 @@ class MainWindow(QMainWindow):
         self._set_processing_state(True)
 
         self.append_log("Starting clip compilation...")
-        self.compilation_requested.emit(input_folder, output_folder, total_dur_seconds, clip_dur, encoder, skip_silence)
+        self.compilation_requested.emit(input_folder, output_folder, total_dur_seconds, clip_dur, encoder)
 
     def _on_silence_clicked(self) -> None:
         file_path = self.silence_file_edit.text().strip()

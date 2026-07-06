@@ -46,7 +46,6 @@ class Application:
         total_duration: int,
         clip_duration: int,
         encoder: str,
-        skip_silence: bool,
     ) -> None:
         """Create and launch a CompilationWorker (random clip mode)."""
         self._worker = CompilationWorker(
@@ -55,7 +54,6 @@ class Application:
             total_duration=total_duration,
             clip_duration=clip_duration,
             encoder=encoder,
-            skip_silence=skip_silence,
         )
         self._start_worker()
 

@@ -43,7 +43,6 @@ class CompilationWorker(QThread):
         total_duration: int,
         clip_duration: int,
         encoder: str,
-        skip_silence: bool = False,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
@@ -52,7 +51,6 @@ class CompilationWorker(QThread):
         self.total_duration = float(total_duration)
         self.clip_duration = float(clip_duration)
         self.encoder = encoder
-        self.skip_silence = skip_silence
 
         # Create the engine and wire logging
         self.engine = FFmpegEngine()
@@ -150,41 +148,26 @@ class CompilationWorker(QThread):
 
         total_videos = len(video_files)
 
-        if self.skip_silence:
-            self.log_message.emit(
-                "Skipping silence detection — using full video duration..."
-            )
-            for idx, video_path in enumerate(video_files):
-                filename = os.path.basename(video_path)
-                duration = self.engine.get_video_duration(video_path)
-                if duration > 1.0:
-                    videos_segments[video_path] = [(0.0, duration)]
-                    self.log_message.emit(
-                        f"Full duration of \"{filename}\": {duration:.1f}s"
-                    )
-                else:
-                    videos_segments[video_path] = []
-                    self.log_message.emit(
-                        f"Warning: \"{filename}\" too short ({duration:.1f}s), skipping."
-                    )
-
-                # Progress: 10 % → 50 % across all videos
-                progress = 10 + int((idx + 1) / total_videos * 40)
-                self.progress_percent.emit(progress)
-        else:
-            for idx, video_path in enumerate(video_files):
-                filename = os.path.basename(video_path)
-                self.log_message.emit(f"Analyzing \"{filename}\"...")
-
-                segments = self.engine.detect_silence(video_path)
-                videos_segments[video_path] = segments
+        self.log_message.emit(
+            "Using full video duration for compilation..."
+        )
+        for idx, video_path in enumerate(video_files):
+            filename = os.path.basename(video_path)
+            duration = self.engine.get_video_duration(video_path)
+            if duration > 1.0:
+                videos_segments[video_path] = [(0.0, duration)]
                 self.log_message.emit(
-                    f"Found {len(segments)} non-silent segment(s) in \"{filename}\""
+                    f"Full duration of \"{filename}\": {duration:.1f}s"
+                )
+            else:
+                videos_segments[video_path] = []
+                self.log_message.emit(
+                    f"Warning: \"{filename}\" too short ({duration:.1f}s), skipping."
                 )
 
-                # Progress: 10 % → 50 % across all videos
-                progress = 10 + int((idx + 1) / total_videos * 40)
-                self.progress_percent.emit(progress)
+            # Progress: 10 % → 50 % across all videos
+            progress = 10 + int((idx + 1) / total_videos * 40)
+            self.progress_percent.emit(progress)
 
         if self.isInterruptionRequested():
             self.log_message.emit("Cancelled by user.")
