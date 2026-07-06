@@ -11,6 +11,7 @@ import re
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Callable, Optional
 
@@ -26,6 +27,19 @@ class FFmpegEngine:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ffmpeg_bin(name: str) -> str:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+            candidate = os.path.join(base, f"{name}.exe")
+            if os.path.isfile(candidate):
+                return candidate
+        if hasattr(sys, "_MEIPASS"):
+            candidate = os.path.join(sys._MEIPASS, f"{name}.exe")
+            if os.path.isfile(candidate):
+                return candidate
+        return name
 
     def _log(self, message: str) -> None:
         """Emit a log message through the external callback, if set."""
@@ -84,7 +98,7 @@ class FFmpegEngine:
         """
         filter_str = f"silencedetect=noise={noise_threshold}dB:d={min_duration}"
         cmd = [
-            "ffmpeg",
+            self._ffmpeg_bin("ffmpeg"),
             "-y",
             "-i", video_path,
             "-af", filter_str,
@@ -206,7 +220,7 @@ class FFmpegEngine:
         Returns ``0.0`` if the duration could not be retrieved.
         """
         cmd = [
-            "ffprobe",
+            self._ffmpeg_bin("ffprobe"),
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "csv=p=0",
@@ -240,7 +254,7 @@ class FFmpegEngine:
             ``True`` if the file has no video stream.
         """
         cmd = [
-            "ffprobe",
+            self._ffmpeg_bin("ffprobe"),
             "-v", "error",
             "-select_streams", "v",
             "-show_entries", "stream=codec_type",
@@ -395,7 +409,7 @@ class FFmpegEngine:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         cmd = [
-            "ffmpeg",
+            self._ffmpeg_bin("ffmpeg"),
             "-y",
             "-fflags", "+genpts",
             "-ss", f"{start:.3f}",
@@ -472,7 +486,7 @@ class FFmpegEngine:
         try:
             r = subprocess.run(
                 [
-                    "ffprobe", "-v", "error",
+                    self._ffmpeg_bin("ffprobe"), "-v", "error",
                     "-select_streams", "v:0",
                     "-show_entries", "stream=width,height",
                     "-of", "csv=s=x:p=0",
@@ -507,7 +521,7 @@ class FFmpegEngine:
 
         # --- Run concat ---
         def _run_concat(codec: str, extra_args: list[str], label: str) -> bool:
-            cmd = ["ffmpeg", "-y"]
+            cmd = [self._ffmpeg_bin("ffmpeg"), "-y"]
             for clip in clip_paths:
                 cmd.extend(["-i", clip])
             cmd.extend([
@@ -587,7 +601,7 @@ class FFmpegEngine:
             return False
 
         cmd = [
-            "ffmpeg",
+            self._ffmpeg_bin("ffmpeg"),
             "-y",
             "-f", "concat",
             "-safe", "0",
