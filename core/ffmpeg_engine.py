@@ -2,8 +2,10 @@
 FFmpegEngine — Encapsulates all FFmpeg/FFprobe operations for the Smart Video Compiler.
 
 All calls use ``subprocess.run()`` directly against the ``ffmpeg`` / ``ffprobe``
-binaries (assumed to be on PATH).  No third-party wrappers (e.g. ffmpeg-python)
-are used.
+binaries.  At development time they are resolved from PATH; when the app is
+frozen with PyInstaller they are resolved from ``sys._MEIPASS`` or the
+executable directory (``--onedir`` mode).  No third-party wrappers
+(e.g. ffmpeg-python) are used.
 """
 
 import os
@@ -57,7 +59,7 @@ class FFmpegEngine:
             full_desc = cmd_str
         # (The engine itself does not log here unless the caller's callback is set)
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
         except subprocess.CalledProcessError as exc:
             raise  # let callers handle
 
@@ -262,7 +264,7 @@ class FFmpegEngine:
             file_path,
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             return result.stdout.strip() == ""
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
@@ -429,7 +431,7 @@ class FFmpegEngine:
         self._log(f"Cutting clip: {cmd_str}")
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             # Verify output file is not truncated
             if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
                 self._log(f"Clip \"{output_path}\" was truncated (size < 1 KB)")
@@ -493,6 +495,7 @@ class FFmpegEngine:
                     clip_paths[0],
                 ],
                 capture_output=True, text=True, check=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             target_w, target_h = r.stdout.strip().split("x")
         except Exception:
@@ -539,7 +542,7 @@ class FFmpegEngine:
 
             try:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
                 return True
             except subprocess.CalledProcessError as exc:
                 self._log(f"Concatenation failed ({label}): exit code {exc.returncode}")
@@ -616,7 +619,7 @@ class FFmpegEngine:
 
         try:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             return True
         except subprocess.CalledProcessError as exc:
             self._log(f"Audio concatenation failed: {exc}")
