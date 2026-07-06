@@ -491,10 +491,10 @@ class FFmpegEngine:
                 f",setsar=1[v{i}]"
             )
 
-        concat_v = "".join(f"[v{i}]" for i in range(n))
-        concat_a = "".join(f"[{i}:a]" for i in range(n))
+        # concat filter requires INTERLEAVED inputs: [v0][0:a][v1][1:a]...
+        concat_inputs = "".join(f"[v{i}][{i}:a]" for i in range(n))
         filter_lines.append(
-            f"{concat_v}{concat_a}concat=n={n}:v=1:a=1[outv][outa]"
+            f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
         )
 
         filter_complex = ";".join(filter_lines)
@@ -522,9 +522,12 @@ class FFmpegEngine:
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
                 return True
             except subprocess.CalledProcessError as exc:
-                self._log(f"Concatenation failed ({label}): {exc}")
+                self._log(f"Concatenation failed ({label}): exit code {exc.returncode}")
                 if exc.stderr:
-                    self._log(f"FFmpeg stderr: {exc.stderr[:500]}")
+                    # Show last 40 lines — the actual error is at the end
+                    stderr_lines = exc.stderr.strip().split("\n")
+                    tail = stderr_lines[-min(40, len(stderr_lines)):]
+                    self._log(f"FFmpeg stderr (last {len(tail)} lines):\n" + "\n".join(tail))
                 return False
             except FileNotFoundError:
                 self._log("ffmpeg binary not found on PATH")
