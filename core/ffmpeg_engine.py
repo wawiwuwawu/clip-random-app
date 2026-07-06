@@ -408,8 +408,6 @@ class FFmpegEngine:
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "128k",
-            "-shortest",
-            "-async", "1",
             "-avoid_negative_ts", "make_zero",
             output_path,
         ]
@@ -418,9 +416,17 @@ class FFmpegEngine:
 
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Verify output file is not truncated
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
+                self._log(f"Clip \"{output_path}\" was truncated (size < 1 KB)")
+                return False
             return True
         except subprocess.CalledProcessError as exc:
             self._log(f"Failed to cut clip \"{output_path}\": {exc}")
+            if exc.stderr:
+                stderr_lines = exc.stderr.strip().split("\n")
+                tail = stderr_lines[-min(10, len(stderr_lines)):]
+                self._log("FFmpeg stderr:\n" + "\n".join(tail))
             return False
         except FileNotFoundError:
             self._log("ffmpeg binary not found on PATH")
