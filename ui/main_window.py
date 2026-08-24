@@ -869,8 +869,8 @@ class MainWindow(QMainWindow):
         params_layout.addLayout(params_grid)
 
         self.noise_hint = QLabel(
-            "FFT: fast, good against hiss/fan noise. "
-            "AI RNNoise: best clarity for voice content."
+            "FFT auto-calibrates from this file's silent gaps. "
+            "AI RNNoise gives the clearest voice \u2014 Strong runs it twice."
         )
         self.noise_hint.setObjectName("hint-label")
         self.noise_hint.setWordWrap(True)

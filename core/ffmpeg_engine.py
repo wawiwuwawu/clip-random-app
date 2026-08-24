@@ -87,16 +87,43 @@ def resolve_noise_model_path(name: str = NOISE_MODEL_FILENAME) -> str:
     return name
 
 
-def build_noise_filters(mode: str, strength: str) -> list[str]:
+def build_noise_filters(
+    mode: str,
+    strength: str,
+    noise_floor_db: float | None = None,
+) -> list[str]:
     """
     Build the audio-filter chain for background-noise removal.
 
-    ``mode="fft"`` uses the built-in afftdn denoiser scaled by *strength*;
-    ``mode="ai"`` uses the RNNoise neural filter with the bundled model.
+    ``mode="fft"`` uses the built-in afftdn denoiser. When *noise_floor_db*
+    (measured from the file's silent gaps) is provided, the filter's noise
+    floor is auto-calibrated so the reduction actually bites regardless of
+    how clean or noisy the recording is; otherwise conservative static
+    presets are used. ``mode="ai"`` chains the RNNoise neural filter —
+    Strong runs it twice for maximum clarity.
     """
+    s = (strength or "medium").lower()
+
     if (mode or "").lower() == "ai":
         model = resolve_noise_model_path()
-        return [f"arnndn=m='{escape_filter_path(model)}'"]
+        escaped = escape_filter_path(model)
+        mix_map = {"light": "0.7", "medium": "1.0", "strong": "1.0"}
+        mix = mix_map.get(s, "1.0")
+        chain = [f"arnndn=m='{escaped}':mix={mix}"]
+        if s == "strong":
+            chain.append(f"arnndn=m='{escaped}'")
+        return chain
+
+    nr_map = {"light": 14, "medium": 24, "strong": 34}
+    nr = nr_map.get(s, 24)
+
+    if noise_floor_db is not None:
+        nf = max(-55.0, min(-22.0, noise_floor_db + 5.0))
+        filters = ["highpass=f=80" if s == "light" else "highpass=f=90"]
+        if s == "strong":
+            filters.append("lowpass=f=14000")
+        filters.append(f"afftdn=nr={nr}:nf={nf:.1f}:tr=1")
+        return filters
 
     presets = {
         "light": ["highpass=f=80", "afftdn=nr=14:nf=-45"],
@@ -107,7 +134,7 @@ def build_noise_filters(mode: str, strength: str) -> list[str]:
             "afftdn=nr=34:nf=-36:tn=1:tr=1",
         ],
     }
-    return presets.get((strength or "medium").lower(), presets["medium"])
+    return presets.get(s, presets["medium"])
 
 
 class FFmpegEngine:
@@ -969,3 +996,107 @@ class FFmpegEngine:
         except Exception as exc:
             self._log(f"Probe {codec} failed: {exc}")
             return False
+
+    # ------------------------------------------------------------------
+    def measure_noise_floor(
+        self,
+        video_path: str,
+        avoid_ranges: list[tuple[float, float]],
+        probe_max: float = 1.5,
+        min_gap: float = 0.4,
+    ) -> float | None:
+        """
+        Estimate the recording's noise floor from its silent gaps.
+
+        Finds the longest window outside *avoid_ranges* (the non-silent
+        segments) and measures ``mean_volume`` there via volumedetect.
+        Returns dBFS, or ``None`` when no usable gap exists.
+        """
+        duration = self.get_video_duration(video_path)
+        if duration <= 0:
+            return None
+
+        ranges = sorted(avoid_ranges)
+        gaps: list[tuple[float, float]] = []
+        cursor = 0.0
+        for start, end in ranges:
+            if start > cursor:
+                gaps.append((cursor, min(start, duration)))
+            cursor = max(cursor, end)
+        if cursor < duration:
+            gaps.append((cursor, duration))
+
+        gaps = [g for g in gaps if g[1] - g[0] >= min_gap]
+        if gaps:
+            gap_start, gap_end = max(gaps, key=lambda g: g[1] - g[0])
+            gap_len = gap_end - gap_start
+            probe_len = min(probe_max, gap_len * 0.8)
+            probe_at = gap_start + (gap_len - probe_len) / 2
+        else:
+            # No usable silent gap (noise floor defeats silence detection) —
+            # approximate with the quietest 0.5s block of the whole file.
+            return self._measure_floor_astats(video_path)
+
+        cmd = [
+            self._ffmpeg_bin("ffmpeg"),
+            "-ss", f"{probe_at:.3f}",
+            "-t", f"{probe_len:.3f}",
+            "-i", video_path,
+            "-af", "volumedetect",
+            "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            self._log(f"Noise floor measurement failed: {exc}")
+            return None
+
+        for line in result.stderr.splitlines():
+            if "mean_volume:" in line:
+                try:
+                    return float(line.split(":")[1].replace("dB", "").strip())
+                except ValueError:
+                    return None
+        return None
+
+    def _measure_floor_astats(self, video_path: str) -> float | None:
+        """
+        Fallback floor estimation: one pass with astats printing per-block
+        RMS levels; the quietest block approximates the noise floor even
+        when the recording never goes truly silent.
+        """
+        cmd = [
+            self._ffmpeg_bin("ffmpeg"),
+            "-hide_banner", "-nostats",
+            "-i", video_path,
+            "-vn",
+            "-af",
+            ("asetnsamples=n=22050:p=0,"
+             "astats=metadata=1:reset=1,"
+             "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-"),
+            "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            self._log(f"astats floor scan failed: {exc}")
+            return None
+
+        values: list[float] = []
+        for line in (result.stdout or "").splitlines():
+            if "RMS_level=" not in line:
+                continue
+            raw = line.rsplit("=", 1)[1].strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if -90.0 < value < 0.0:
+                values.append(value)
+        return min(values) if values else None

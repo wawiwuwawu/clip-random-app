@@ -595,7 +595,23 @@ class SilenceRemovalWorker(QThread):
         if self.denoise.get("enabled"):
             mode = self.denoise.get("mode", "fft")
             strength = self.denoise.get("strength", "medium")
-            audio_filters = build_noise_filters(mode, strength)
+            noise_floor = None
+            if mode != "ai":
+                noise_floor = self.engine.measure_noise_floor(
+                    self.video_path, segments
+                )
+                if noise_floor is not None:
+                    nf_preview = max(-55.0, min(-22.0, noise_floor + 5.0))
+                    self.log_message.emit(
+                        f"Measured noise floor: {noise_floor:.1f} dB "
+                        f"\u2192 denoise floor set to {nf_preview:.1f} dB"
+                    )
+                else:
+                    self.log_message.emit(
+                        "No silent gap long enough to measure \u2014 "
+                        "using default denoise preset."
+                    )
+            audio_filters = build_noise_filters(mode, strength, noise_floor)
             self.log_message.emit(
                 f"Applying noise removal (mode={mode}"
                 + (f", strength={strength}" if mode != "ai" else "")
