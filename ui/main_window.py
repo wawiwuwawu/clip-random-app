@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -40,6 +40,9 @@ from core.ffmpeg_engine import (
     make_timestamp,
     silence_output_name,
 )
+from core import history
+from ui.clip_preview import ClipPreviewDialog
+from ui.history_dialog import HistoryDialog
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma"}
@@ -48,6 +51,18 @@ MEDIA_FILTER = (
     "All Media Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.wmv "
     "*.mp3 *.wav *.aac *.flac *.ogg *.m4a *.wma)"
 )
+
+ENCODER_CHOICES = [
+    "NVIDIA NVENC (h264_nvenc)",
+    "Intel QSV (h264_qsv)",
+    "AMD AMF (h264_amf)",
+    "CPU Software (libx264)",
+    "NVIDIA NVENC HEVC (hevc_nvenc)",
+    "CPU HEVC (libx265)",
+]
+
+ASPECT_LANDSCAPE = "Landscape (source)"
+ASPECT_PORTRAIT = "Portrait 9:16 (Shorts/TikTok)"
 
 
 class DropZone(QWidget):
@@ -168,7 +183,6 @@ class SourceListWidget(QWidget):
         self.list_widget = SourceList(self)
         self.list_widget.setObjectName("source-list")
         self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.list_widget.setAlternatingRowColors(False)
         layout.addWidget(self.list_widget)
 
         buttons_row = QWidget()
@@ -208,7 +222,6 @@ class SourceListWidget(QWidget):
     # ------------------------------------------------------------------
 
     def add_urls(self, urls) -> int:
-        """Add dragged URLs (files and/or folders). Returns count added."""
         added = 0
         for url in urls:
             path = url.toLocalFile()
@@ -223,7 +236,6 @@ class SourceListWidget(QWidget):
         return added
 
     def add_paths(self, paths: list[str]) -> int:
-        """Add explicit filesystem paths (files and/or folders)."""
         added = 0
         for path in paths:
             if Path(path).is_dir():
@@ -274,7 +286,6 @@ class SourceListWidget(QWidget):
     # ------------------------------------------------------------------
 
     def get_sources(self) -> list[tuple[str, str]]:
-        """Return entries as ``(kind, path)`` tuples in insertion order."""
         return [
             (item.data(self.KIND_ROLE), item.text())
             for item in self._iter_items()
@@ -471,9 +482,14 @@ class MainWindow(QMainWindow):
     output_folder_edit: FolderDropLineEdit
     total_duration_spin: QSpinBox
     clip_duration_spin: QSpinBox
+    aspect_combo: QComboBox
+    scene_check: QPushButton
+    fade_check: QPushButton
     encoder_combo: QComboBox
+    encoder_warning: QLabel
     detected_label: QLabel
     preview_label: QLabel
+    queue_status_label: QLabel
     silence_drop_zone: DropZone
     silence_file_edit: QLineEdit
     threshold_spin: QSpinBox
@@ -487,10 +503,14 @@ class MainWindow(QMainWindow):
     log_console: QPlainTextEdit
 
     # Public signals
-    compilation_requested = Signal(list, str, int, int, str)
+    plan_requested = Signal(list, str, int, int, str, bool, bool, float)
+    render_requested = Signal(object)
+    discard_session_requested = Signal(object)
     silence_removal_requested = Signal(str, str, str, int, float, float)
     cancellation_requested = Signal()
     ffmpeg_override_changed = Signal(str)
+
+    PLAN_BUTTON_TEXT = "Plan Clips"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -499,11 +519,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(780, 550)
         self.resize(960, 700)
 
-        self._processing = False
+        self._busy_owner: str | None = None
         self._detected_key: str | None = None
         self._detect_worker: GpuDetectWorker | None = None
         self._settings_reset_requested = False
         self._loading = False
+        self._queued_count = 0
 
         self._build_ui()
         self._apply_stylesheet()
@@ -582,6 +603,12 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
+        self.history_button = QPushButton("History")
+        self.history_button.setObjectName("header-text-button")
+        self.history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.history_button.setToolTip("Past jobs")
+        self.history_button.clicked.connect(self._open_history)
+
         self.settings_button = QPushButton("\u2699")
         self.settings_button.setObjectName("icon-button")
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -594,6 +621,8 @@ class MainWindow(QMainWindow):
         self.help_button.setToolTip("Help")
         self.help_button.clicked.connect(self._open_help)
 
+        layout.addWidget(self.history_button)
+        layout.addSpacing(12)
         layout.addWidget(self.settings_button)
         layout.addSpacing(12)
         layout.addWidget(self.help_button)
@@ -633,7 +662,7 @@ class MainWindow(QMainWindow):
 
         title = self._create_mode_title(
             "Clip Compiler",
-            "Pick random highlights from your videos and compile them into one.",
+            "Review random highlight clips before compiling them into one video.",
         )
         layout.addWidget(title)
 
@@ -666,14 +695,45 @@ class MainWindow(QMainWindow):
         self.clip_duration_spin.setValue(10)
         self.clip_duration_spin.setFixedWidth(90)
 
+        aspect_label = QLabel("Aspect")
+        aspect_label.setObjectName("field-label")
+        aspect_label.setFixedWidth(160)
+        self.aspect_combo = QComboBox()
+        self.aspect_combo.addItem(ASPECT_LANDSCAPE)
+        self.aspect_combo.addItem(ASPECT_PORTRAIT)
+        self.aspect_combo.setFixedWidth(260)
+        self.aspect_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        options_grid_row = 3
+
+        self.scene_check = QPushButton("Cut at scene boundaries (slower planning)")
+        self.scene_check.setObjectName("check-pill")
+        self.scene_check.setCheckable(True)
+        self.scene_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scene_check.setToolTip(
+            "Snap clip starts to detected scene changes instead of raw offsets."
+        )
+
+        self.fade_check = QPushButton("Smooth fade between clips (0.5s)")
+        self.fade_check.setObjectName("check-pill")
+        self.fade_check.setCheckable(True)
+        self.fade_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fade_check.setToolTip(
+            "Off = hard cut (default). On = 0.5s crossfade between clips."
+        )
+
         settings_grid.addWidget(total_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.total_duration_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(clip_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.clip_duration_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        settings_grid.addWidget(aspect_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        settings_grid.addWidget(self.aspect_combo, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        settings_grid.addWidget(self.scene_check, options_grid_row, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
+        settings_grid.addWidget(self.fade_check, options_grid_row + 1, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_layout.addLayout(settings_grid)
         layout.addWidget(settings_card)
 
-        self.compile_button = QPushButton("Start Compilation")
+        self.compile_button = QPushButton(self.PLAN_BUTTON_TEXT)
         self.compile_button.setMinimumHeight(44)
         self.compile_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.compile_button.clicked.connect(self._on_compile_clicked)
@@ -808,16 +868,9 @@ class MainWindow(QMainWindow):
         encoder_label.setFixedWidth(160)
         self.encoder_combo = QComboBox()
         self.encoder_combo.addItem(AUTO_ENCODER_LABEL)
-        self.encoder_combo.addItems(
-            [
-                "NVIDIA NVENC (h264_nvenc)",
-                "Intel QSV (h264_qsv)",
-                "AMD AMF (h264_amf)",
-                "CPU Software (libx264)",
-            ]
-        )
+        self.encoder_combo.addItems(ENCODER_CHOICES)
         self.encoder_combo.setCurrentIndex(0)
-        self.encoder_combo.setFixedWidth(260)
+        self.encoder_combo.setFixedWidth(300)
         self.encoder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         grid.addWidget(output_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -831,6 +884,15 @@ class MainWindow(QMainWindow):
         self.detected_label.setObjectName("hint-label")
         layout.addWidget(self.detected_label)
 
+        self.encoder_warning = QLabel(
+            "HEVC: files are ~30-40% smaller but need newer devices/players "
+            "for playback."
+        )
+        self.encoder_warning.setObjectName("warn-label")
+        self.encoder_warning.setWordWrap(True)
+        self.encoder_warning.setVisible(False)
+        layout.addWidget(self.encoder_warning)
+
         self.preview_label = QLabel("")
         self.preview_label.setObjectName("hint-label")
         self.preview_label.setWordWrap(True)
@@ -841,9 +903,14 @@ class MainWindow(QMainWindow):
     def _create_progress_log_card(self) -> QFrame:
         card, layout = self._create_card("Progress Logs")
 
-        self.status_label = QLabel("Ready — Waiting for input...")
+        self.status_label = QLabel("Ready \u2014 Add video sources to begin.")
         self.status_label.setObjectName("status-label")
         layout.addWidget(self.status_label)
+
+        self.queue_status_label = QLabel("")
+        self.queue_status_label.setObjectName("queue-label")
+        self.queue_status_label.setVisible(False)
+        layout.addWidget(self.queue_status_label)
 
         progress_row = QWidget()
         progress_layout = QHBoxLayout(progress_row)
@@ -994,6 +1061,18 @@ class MainWindow(QMainWindow):
                 color: #374151;
             }
 
+            #header-text-button {
+                background-color: transparent;
+                border: none;
+                color: #6B7280;
+                font-size: 13px;
+                padding: 6px 8px;
+            }
+
+            #header-text-button:hover {
+                color: #2563EB;
+            }
+
             #icon-button {
                 background-color: transparent;
                 border: none;
@@ -1059,6 +1138,38 @@ class MainWindow(QMainWindow):
                 line-height: 15px;
             }
 
+            #warn-label {
+                font-size: 11px;
+                color: #B45309;
+                line-height: 15px;
+            }
+
+            #queue-label {
+                font-size: 11px;
+                color: #2563EB;
+                font-weight: 600;
+            }
+
+            #check-pill {
+                background-color: #F9FAFB;
+                border: 1px solid #D1D5DB;
+                border-radius: 9999px;
+                color: #4B5563;
+                padding: 6px 14px;
+                font-size: 12px;
+            }
+
+            #check-pill:checked {
+                background-color: #EFF6FF;
+                border: 1px solid #2563EB;
+                color: #1D4ED8;
+                font-weight: 600;
+            }
+
+            #check-pill:hover:!checked {
+                border: 1px solid #9CA3AF;
+            }
+
             QLineEdit,
             QSpinBox,
             QDoubleSpinBox,
@@ -1111,7 +1222,8 @@ class MainWindow(QMainWindow):
                 padding: 4px;
             }
 
-            #source-list {
+            #source-list,
+            #preview-list {
                 background-color: #FFFFFF;
                 border: 1px dashed #C2C6D4;
                 border-radius: 8px;
@@ -1120,17 +1232,20 @@ class MainWindow(QMainWindow):
                 min-height: 120px;
             }
 
-            #source-list::item {
+            #source-list::item,
+            #preview-list::item {
                 padding: 6px 8px;
                 border-radius: 4px;
             }
 
-            #source-list::item:selected {
+            #source-list::item:selected,
+            #preview-list::item:selected {
                 background-color: #EFF6FF;
                 color: #1D4ED8;
             }
 
-            #source-list::item:hover:!selected {
+            #source-list::item:hover:!selected,
+            #preview-list::item:hover:!selected {
                 background-color: #F3F4F6;
             }
 
@@ -1295,13 +1410,27 @@ class MainWindow(QMainWindow):
     def _connect_dynamic_updates(self) -> None:
         self.total_duration_spin.valueChanged.connect(lambda _: self._save_settings())
         self.clip_duration_spin.valueChanged.connect(lambda _: self._save_settings())
-        self.encoder_combo.currentTextChanged.connect(lambda _: self._save_settings())
+        self.encoder_combo.currentTextChanged.connect(
+            lambda _: self._on_encoder_changed()
+        )
+        self.aspect_combo.currentTextChanged.connect(lambda _: self._save_settings())
+        self.scene_check.toggled.connect(lambda _: self._save_settings())
+        self.fade_check.toggled.connect(lambda _: self._save_settings())
         self.threshold_spin.valueChanged.connect(lambda _: self._save_settings())
         self.min_duration_spin.valueChanged.connect(lambda _: self._save_settings())
         self.padding_spin.valueChanged.connect(lambda _: self._save_settings())
 
         self.output_folder_edit.textChanged.connect(lambda _: self._on_output_changed())
-        self.silence_file_edit.textChanged.connect(lambda _: self._on_silence_file_text_changed())
+        self.silence_file_edit.textChanged.connect(
+            lambda _: self._on_silence_file_text_changed()
+        )
+
+    def _on_encoder_changed(self) -> None:
+        text = self.encoder_combo.currentText().lower()
+        is_hevc = "hevc" in text and text != AUTO_ENCODER_LABEL.lower()
+        self.encoder_warning.setVisible(is_hevc)
+        if not self._loading:
+            self._save_settings()
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -1347,6 +1476,14 @@ class MainWindow(QMainWindow):
         self.total_duration_spin.setValue(int(settings.value("total_duration", 5)))
         self.clip_duration_spin.setValue(int(settings.value("clip_duration", 10)))
 
+        aspect_choice = settings.value("aspect_choice", ASPECT_LANDSCAPE, type=str)
+        aspect_index = self.aspect_combo.findText(aspect_choice)
+        if aspect_index >= 0:
+            self.aspect_combo.setCurrentIndex(aspect_index)
+
+        self.scene_check.setChecked(settings.value("scene_cut", False, type=bool))
+        self.fade_check.setChecked(settings.value("crossfade", False, type=bool))
+
         encoder_choice = settings.value("encoder_choice", "", type=str)
         index = self.encoder_combo.findText(encoder_choice)
         if index >= 0:
@@ -1365,13 +1502,14 @@ class MainWindow(QMainWindow):
         sources = self.source_list.get_sources()
         settings.setValue(
             "sources",
-            json.dumps(
-                [{"kind": kind, "path": path} for kind, path in sources]
-            ),
+            json.dumps([{"kind": kind, "path": path} for kind, path in sources]),
         )
         settings.setValue("output_folder", self.output_folder_edit.text().strip())
         settings.setValue("total_duration", self.total_duration_spin.value())
         settings.setValue("clip_duration", self.clip_duration_spin.value())
+        settings.setValue("aspect_choice", self.aspect_combo.currentText())
+        settings.setValue("scene_cut", self.scene_check.isChecked())
+        settings.setValue("crossfade", self.fade_check.isChecked())
         settings.setValue("encoder_choice", self.encoder_combo.currentText())
         settings.setValue("threshold_db", self.threshold_spin.value())
         settings.setValue("min_duration", self.min_duration_spin.value())
@@ -1402,7 +1540,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def start_detection(self) -> None:
-        """Start background hardware encoder detection (safe to re-call)."""
         if self._detect_worker is not None:
             return
         self.detected_label.setText("Detecting GPU encoder...")
@@ -1473,7 +1610,9 @@ class MainWindow(QMainWindow):
             return
 
         stem = Path(media_path).stem
-        extension = ".m4a" if Path(media_path).suffix.lower() in AUDIO_EXTENSIONS else ".mp4"
+        extension = (
+            ".m4a" if Path(media_path).suffix.lower() in AUDIO_EXTENSIONS else ".mp4"
+        )
         name = silence_output_name(stem, extension, stamp)
         self.preview_label.setText(f"Output: {os.path.join(output_folder, name)}")
 
@@ -1492,7 +1631,7 @@ class MainWindow(QMainWindow):
         self._update_output_preview()
 
     def _restore_status_label(self) -> None:
-        if self._processing:
+        if self._busy_owner is not None:
             return
         self.status_label.setStyleSheet("color: #22C55E;")
         if self.content_stack.currentIndex() == 0:
@@ -1515,11 +1654,9 @@ class MainWindow(QMainWindow):
             self.append_log(f"Output folder set to: {folder}")
 
     def _browse_silence_file(self) -> None:
+        start_dir = self.silence_file_edit.text() or str(Path.home())
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Media File",
-            str(Path.home()) if not self.silence_file_edit.text() else self.silence_file_edit.text(),
-            MEDIA_FILTER,
+            self, "Select Media File", start_dir, MEDIA_FILTER
         )
         if file_path:
             self.silence_file_edit.setText(file_path)
@@ -1553,7 +1690,9 @@ class MainWindow(QMainWindow):
         target = path if kind == "dir" else str(Path(path).parent)
         return os.path.abspath(target) == os.path.abspath(output_folder)
 
-    def _confirm_no_overlap(self, sources: list[tuple[str, str]], output_folder: str) -> bool:
+    def _confirm_no_overlap(
+        self, sources: list[tuple[str, str]], output_folder: str
+    ) -> bool:
         for kind, path in sources:
             if self._overlaps_source(kind, path, output_folder):
                 reply = QMessageBox.question(
@@ -1595,11 +1734,17 @@ class MainWindow(QMainWindow):
             return
 
         encoder = self._effective_encoder_display()
+        portrait = self.aspect_combo.currentIndex() == 1
+        scene_cut = self.scene_check.isChecked()
+        crossfade = 0.5 if self.fade_check.isChecked() else 0.0
 
-        self._set_processing_state(True)
-        self.append_log("Starting clip compilation...")
-        self.compilation_requested.emit(
-            sources, output_folder, total_dur_seconds, clip_dur, encoder
+        self.compile_button.setEnabled(False)
+        self.compile_button.setText("Planning...")
+        self.append_log("Planning clips...")
+
+        self.plan_requested.emit(
+            sources, output_folder, total_dur_seconds, clip_dur,
+            encoder, portrait, scene_cut, crossfade,
         )
 
     def _on_silence_clicked(self) -> None:
@@ -1628,7 +1773,6 @@ class MainWindow(QMainWindow):
         min_duration = self.min_duration_spin.value()
         padding = self.padding_spin.value()
 
-        self._set_processing_state(True)
         self.append_log("Starting silence removal...")
         self.silence_removal_requested.emit(
             file_path, output_folder, encoder, threshold_db, min_duration, padding
@@ -1641,15 +1785,13 @@ class MainWindow(QMainWindow):
         self.cancellation_requested.emit()
 
     # ------------------------------------------------------------------
-    # Processing state
+    # Job state (driven by Application via begin_job / end_job)
     # ------------------------------------------------------------------
 
-    def _set_processing_state(self, processing: bool) -> None:
-        self._processing = processing
-        self.compile_button.setEnabled(not processing)
-        self.silence_button.setEnabled(not processing)
-
-        if processing:
+    def begin_job(self, kind: str) -> None:
+        """Mark a job as started. Only one owner drives the progress UI."""
+        if self._busy_owner is None:
+            self._busy_owner = kind
             self.progress_bar.setValue(0)
             self.progress_bar.setVisible(True)
             self.cancel_button.setVisible(True)
@@ -1658,12 +1800,41 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #2563EB;")
             self.status_label.setText("Processing...")
             self._log_separator()
+        elif self._busy_owner == "plan" and kind == "render":
+            # Render supersedes planning-only ownership.
+            self._busy_owner = "render"
+            self.progress_bar.setValue(0)
+            self.status_label.setStyleSheet("color: #2563EB;")
+            self.status_label.setText("Processing...")
+
+        if kind != "plan":
+            self.compile_button.setEnabled(True)
+            self.compile_button.setText(self.PLAN_BUTTON_TEXT)
+
+    def end_job(self) -> None:
+        """Reset all job visuals back to idle."""
+        self._busy_owner = None
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("Cancel")
+        self.compile_button.setEnabled(True)
+        self.compile_button.setText(self.PLAN_BUTTON_TEXT)
+        self._restore_status_label()
+
+    def update_queue_count(self, count: int) -> None:
+        self._queued_count = count
+        if count > 0:
+            self.queue_status_label.setText(f"{count} job(s) queued")
+            self.queue_status_label.setVisible(True)
         else:
-            self.progress_bar.setVisible(False)
-            self.cancel_button.setVisible(False)
-            self.cancel_button.setEnabled(True)
-            self.cancel_button.setText("Cancel")
-            self._restore_status_label()
+            self.queue_status_label.setVisible(False)
+
+    def _planning_cleanup(self) -> None:
+        """Re-enable the Plan button when a plan attempt ends without render."""
+        if self._busy_owner is None:
+            self.compile_button.setEnabled(True)
+            self.compile_button.setText(self.PLAN_BUTTON_TEXT)
 
     def _log_separator(self) -> None:
         from datetime import datetime
@@ -1675,6 +1846,20 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Dialogs
     # ------------------------------------------------------------------
+
+    def on_plan_ready(self, session) -> None:
+        """Open the preview dialog for a freshly planned session."""
+        dialog = ClipPreviewDialog(
+            self, session, FFmpegEngine(), log_fn=self.append_log
+        )
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted and dialog.included_clips():
+            self.render_requested.emit(session)
+        else:
+            if accepted and not dialog.included_clips():
+                self.append_log("No clips selected \u2014 nothing to render.")
+            self.discard_session_requested.emit(session)
+            self.end_job()
 
     def _open_settings(self) -> None:
         settings = self._settings()
@@ -1703,6 +1888,9 @@ class MainWindow(QMainWindow):
             f"(resolved: {engine.get_resolved_ffmpeg_path()})"
         )
 
+    def _open_history(self) -> None:
+        HistoryDialog(self).exec()
+
     def _open_help(self) -> None:
         if self._detected_key is None:
             gpu_line = "GPU detection still running..."
@@ -1714,12 +1902,15 @@ class MainWindow(QMainWindow):
         engine = FFmpegEngine()
         help_text = (
             "<h3>Clip Compiler</h3>"
-            "<p>Add single video files and/or entire folders as sources. "
-            "Random non-overlapping clips are cut from each video and merged "
-            "into one compilation.</p>"
+            "<p>Add single video files and/or entire folders, then click "
+            "<b>Plan Clips</b>. Review the planned clips (exclude / re-roll "
+            "any of them) and confirm to render.</p>"
             "<h3>Silence Removal</h3>"
-            "<p>Drop one media file (video or audio). Silent regions are removed "
-            "and the remaining parts are merged into a cleaned copy.</p>"
+            "<p>Drop one media file (video or audio). Silent regions are "
+            "removed and the remaining parts are merged into a cleaned copy.</p>"
+            "<h3>Queue</h3>"
+            "<p>Starting a job while another runs adds it to the queue; jobs "
+            "are processed one by one.</p>"
             "<h3>Current Encoding</h3>"
             f"<p>{gpu_line}<br>"
             f"FFmpeg: {engine.get_resolved_ffmpeg_path()}</p>"
@@ -1735,8 +1926,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def set_phase(self, message: str) -> None:
-        """Show a pipeline phase message while processing."""
-        if self._processing:
+        if self._busy_owner is not None:
             self.status_label.setText(message)
 
     def append_log(self, message: str) -> None:
@@ -1751,7 +1941,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setVisible(True)
 
     def on_compilation_finished(self, output_path: str) -> None:
-        self._set_processing_state(False)
+        self.end_job()
         self.append_log(f"Finished: {output_path}")
 
         box = QMessageBox(self)
@@ -1770,7 +1960,7 @@ class MainWindow(QMainWindow):
 
     def on_compilation_error(self, error_message: str) -> None:
         cancelled = error_message.strip() == "Cancelled by user."
-        self._set_processing_state(False)
+        self.end_job()
         if cancelled:
             self.status_label.setStyleSheet("color: #DC2626;")
             self.status_label.setText("Cancelled by user.")

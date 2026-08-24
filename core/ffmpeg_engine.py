@@ -28,6 +28,8 @@ ENCODER_DISPLAY_TO_KEY: dict[str, str] = {
     "Intel QSV (h264_qsv)": "qsv",
     "AMD AMF (h264_amf)": "amf",
     CPU_ENCODER_DISPLAY: "cpu",
+    "NVIDIA NVENC HEVC (hevc_nvenc)": "nvenc_hevc",
+    "CPU HEVC (libx265)": "cpu_hevc",
 }
 
 GPU_ENCODER_KEYS = ("nvenc", "qsv", "amf")
@@ -324,114 +326,166 @@ class FFmpegEngine:
             return False
 
     # ------------------------------------------------------------------
-    def extract_random_clips(
+    def plan_clips(
         self,
         videos_segments: dict[str, list[tuple[float, float]]],
         clip_duration: float,
         total_target: float,
         temp_dir: Optional[str] = None,
+        scene_times: Optional[dict[str, list[float]]] = None,
         log_callback: Optional[Callable[[str], None]] = None,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, list[tuple[float, float]]]]:
         """
-        Plan a compilation by randomly selecting non-overlapping clips from the
-        provided non-silent segments.
+        Plan a compilation by randomly selecting non-overlapping clips from
+        the provided segments.
 
-        Parameters
-        ----------
-        videos_segments : dict[str, list[tuple[float, float]]]
-            Mapping video path -> list of non-silent (start, end) segments.
-        clip_duration : float
-            Desired duration (seconds) of each clip in the output.
-        total_target : float
-            Minimum total duration (seconds) the compilation should aim for.
-        temp_dir : str, optional
-            Directory for generated clip output paths. If ``None``, one is
-            created automatically.
-        log_callback : Callable, optional
-            Override / additional log receiver for this method.
-
-        Returns
-        -------
-        list[dict]
-            Each dict has keys: ``video``, ``start``, ``duration``, ``output``.
+        Returns ``(selected, candidates_by_video)`` where *selected* entries
+        have keys ``video``/``start``/``duration``/``output`` and
+        *candidates_by_video* holds every possible (start, end) candidate per
+        video for later re-rolls.
         """
         log = log_callback or self._log
+        scene_map = scene_times or {}
 
-        # ---- 1. Build the candidate pool ---------------------------------
         candidates: list[dict] = []
-        # Track used ranges per video path (list of (start, end) tuples)
-        used_ranges: dict[str, list[tuple[float, float]]] = {}
-
         for video_path, segments in videos_segments.items():
-            used_ranges.setdefault(video_path, [])
+            snaps = scene_map.get(video_path) or []
             for seg_start, seg_end in segments:
-                seg_duration = seg_end - seg_start
-                margin = seg_duration * 0.05
+                margin = (seg_end - seg_start) * 0.05
                 trimmed_start = seg_start + margin
                 trimmed_end = seg_end - margin
                 if trimmed_end - trimmed_start < clip_duration:
-                    continue  # segment too short after trimming
-                # Every possible offset where a clip of clip_duration fits
+                    continue
                 offset = 0.0
                 while trimmed_start + offset + clip_duration <= trimmed_end + 0.001:
-                    cand_start = trimmed_start + offset
-                    cand_end = cand_start + clip_duration
+                    cand_start = self._snap_to_scene(trimmed_start + offset, snaps)
+                    if cand_start + clip_duration > trimmed_end + 0.001:
+                        cand_start = trimmed_start + offset
                     candidates.append({
                         "video": video_path,
                         "start": cand_start,
-                        "end": cand_end,
+                        "end": cand_start + clip_duration,
                         "duration": clip_duration,
                     })
-                    # Step by half a second for variety (smooth sliding window)
                     offset += 0.5
 
         if not candidates:
-            log("No valid clip candidates could be generated from the segments.")
-            return []
+            log("No valid clip candidates could be generated from the sources.")
+            return [], {}
 
-        # ---- 2. Shuffle --------------------------------------------------
         random.shuffle(candidates)
-
-        # ---- 3. Greedy selection -----------------------------------------
-        selected: list[dict] = []
-        accumulated = 0.0
 
         if temp_dir is None:
             temp_dir = tempfile.mkdtemp(prefix="svc_")
 
+        selected: list[dict] = []
+        accumulated = 0.0
+        used_ranges: dict[str, list[tuple[float, float]]] = {}
         clip_index = 0
+
         for cand in candidates:
             if accumulated >= total_target:
                 break
-
             path = cand["video"]
-            # Overlap check
-            overlaps = False
-            for used_start, used_end in used_ranges[path]:
-                # Two intervals [a, b) and [c, d) overlap if a < d and c < b
-                if cand["start"] < used_end and used_start < cand["end"]:
-                    overlaps = True
-                    break
-
-            if overlaps:
+            ranges = used_ranges.setdefault(path, [])
+            if any(cand["start"] < e and s < cand["end"] for s, e in ranges):
                 continue
-
-            # Accept
-            used_ranges[path].append((cand["start"], cand["end"]))
+            ranges.append((cand["start"], cand["end"]))
             clip_index += 1
-            output_path = os.path.join(temp_dir, f"clip_{clip_index:03d}.mkv")
             selected.append({
-                "video": cand["video"],
+                "video": path,
                 "start": cand["start"],
                 "duration": cand["duration"],
-                "output": output_path,
+                "output": os.path.join(temp_dir, f"clip_{clip_index:03d}.mkv"),
             })
             accumulated += cand["duration"]
 
-        log(f"Planned {len(selected)} clips from {len(videos_segments)} videos "
+        candidates_by_video: dict[str, list[tuple[float, float]]] = {}
+        for cand in candidates:
+            candidates_by_video.setdefault(cand["video"], []).append(
+                (cand["start"], cand["end"])
+            )
+
+        log(f"Planned {len(selected)} clips "
             f"(accumulated {accumulated:.1f}s, target {total_target:.1f}s)")
 
-        return selected
+        return selected, candidates_by_video
+
+    @staticmethod
+    def _snap_to_scene(
+        start: float, scene_times: list[float], window: float = 0.75
+    ) -> float:
+        """Snap *start* to the nearest scene boundary within *window* seconds."""
+        if not scene_times:
+            return start
+        nearest = min(scene_times, key=lambda t: abs(t - start))
+        if abs(nearest - start) <= window:
+            return max(0.0, nearest)
+        return start
+
+    # ------------------------------------------------------------------
+    def detect_scene_changes(
+        self, video_path: str, threshold: float = 0.4
+    ) -> list[float]:
+        """Return timestamps (seconds) of detected scene changes."""
+        cmd = [
+            self._ffmpeg_bin("ffmpeg"), "-hide_banner", "-nostats",
+            "-i", video_path,
+            "-vf", f"select='gt(scene,{threshold})',showinfo",
+            "-an", "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            self._log(f"Scene detection failed for \"{video_path}\": {exc}")
+            return []
+        times = [
+            float(m.group(1))
+            for m in re.finditer(r"pts_time:([\d.]+)", result.stderr)
+        ]
+        return sorted(set(times))
+
+    # ------------------------------------------------------------------
+    THUMB_W = 240
+    THUMB_H_PORTRAIT = 426
+
+    def generate_thumbnail(
+        self,
+        video_path: str,
+        at_second: float,
+        output_path: str,
+        portrait: bool = False,
+    ) -> bool:
+        """Extract one small preview frame from *video_path*."""
+        if portrait:
+            vf = (
+                f"scale={self.THUMB_W}:{self.THUMB_H_PORTRAIT}"
+                f":force_original_aspect_ratio=increase,"
+                f"crop={self.THUMB_W}:{self.THUMB_H_PORTRAIT}"
+            )
+        else:
+            vf = f"scale={self.THUMB_W}:-2"
+        cmd = [
+            self._ffmpeg_bin("ffmpeg"), "-y",
+            "-ss", f"{max(0.0, at_second):.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", vf,
+            "-q:v", "5",
+            output_path,
+        ]
+        try:
+            subprocess.run(
+                cmd, capture_output=True, text=True, check=True,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+        except Exception as exc:
+            self._log(f"Thumbnail failed for \"{video_path}\": {exc}")
+            return False
 
     # ------------------------------------------------------------------
     def cut_clip(
@@ -508,11 +562,17 @@ class FFmpegEngine:
         clip_paths: list[str],
         output_path: str,
         encoder: str,
+        durations: Optional[list[float]] = None,
+        aspect: str = "landscape",
+        crossfade: float = 0.0,
     ) -> bool:
         """
         Concatenate clips using ffmpeg's concat filter (filter_complex).
-        Each clip is decoded independently, scaled to a common resolution,
-        then concatenated at the frame level — zero PTS discontinuity.
+
+        ``aspect="portrait"`` renders 1080x1920 with a blurred background fill;
+        ``crossfade > 0`` joins clips with an xfade/acrossfade chain instead of
+        a hard cut (requires *durations*). HEVC encoder keys emit ``hvc1``
+        tagged output for broader player support.
         """
         encoder_map: dict[str, dict] = {
             "nvenc": {
@@ -531,6 +591,17 @@ class FFmpegEngine:
                 "codec": "libx264",
                 "args": ["-preset", "fast", "-crf", "23"],
             },
+            "nvenc_hevc": {
+                "codec": "hevc_nvenc",
+                "args": ["-preset", "p4", "-rc", "vbr", "-cq", "24", "-tag:v", "hvc1"],
+            },
+            "cpu_hevc": {
+                "codec": "libx265",
+                "args": ["-preset", "fast", "-crf", "26", "-tag:v", "hvc1"],
+            },
+        }
+        fallback_for = {
+            "nvenc": "cpu", "qsv": "cpu", "amf": "cpu", "nvenc_hevc": "cpu_hevc",
         }
 
         enc_info = encoder_map.get(encoder.lower())
@@ -538,41 +609,80 @@ class FFmpegEngine:
             self._log(f'Unknown encoder "{encoder}". Falling back to libx264.')
             enc_info = encoder_map["cpu"]
 
-        # --- Probe resolution of first clip as target ---
-        try:
-            r = subprocess.run(
-                [
-                    self._ffmpeg_bin("ffprobe"), "-v", "error",
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height",
-                    "-of", "csv=s=x:p=0",
-                    clip_paths[0],
-                ],
-                capture_output=True, text=True, check=True,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            target_w, target_h = r.stdout.strip().split("x")
-        except Exception:
-            target_w, target_h = "1920", "1080"
+        use_xfade = (
+            crossfade > 0
+            and durations is not None
+            and len(clip_paths) >= 2
+            and len(durations) == len(clip_paths)
+        )
 
+        # --- Target resolution ---
         n = len(clip_paths)
+        if aspect == "portrait":
+            target_w, target_h = "1080", "1920"
+        else:
+            try:
+                r = subprocess.run(
+                    [
+                        self._ffmpeg_bin("ffprobe"), "-v", "error",
+                        "-select_streams", "v:0",
+                        "-show_entries", "stream=width,height",
+                        "-of", "csv=s=x:p=0",
+                        clip_paths[0],
+                    ],
+                    capture_output=True, text=True, check=True,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+                target_w, target_h = r.stdout.strip().split("x")
+            except Exception:
+                target_w, target_h = "1920", "1080"
 
         # --- Build filter_complex ---
-        filter_lines = []
+        filter_lines: list[str] = []
         for i in range(n):
-            # Scale each clip to target resolution with letterbox + square pixels
-            filter_lines.append(
-                f"[{i}:v]scale={target_w}:{target_h}"
-                f":force_original_aspect_ratio=decrease"
-                f",pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
-                f",setsar=1[v{i}]"
-            )
+            if aspect == "portrait":
+                chain = (
+                    f"[{i}:v]split=2[bga{i}][fga{i}]"
+                    f";[bga{i}]scale={target_w}:{target_h}"
+                    f":force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
+                    f",gblur=sigma=12[bg{i}]"
+                    f";[fga{i}]scale={target_w}:-2[fg{i}]"
+                    f";[bg{i}][fg{i}]overlay=(W-w)/2:(H-h)/2,setsar=1"
+                )
+            else:
+                chain = (
+                    f"[{i}:v]scale={target_w}:{target_h}"
+                    f":force_original_aspect_ratio=decrease"
+                    f",pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+                )
+            if use_xfade:
+                chain += ",fps=30,settb=AVTB"
+            filter_lines.append(f"{chain}[v{i}]")
 
-        # concat filter requires INTERLEAVED inputs: [v0][0:a][v1][1:a]...
-        concat_inputs = "".join(f"[v{i}][{i}:a]" for i in range(n))
-        filter_lines.append(
-            f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
-        )
+        if use_xfade:
+            fade = float(crossfade)
+            length = (durations or [])[0]
+            prev_v, prev_a = "[v0]", "[0:a]"
+            for i in range(1, n):
+                is_last = i == n - 1
+                vx = "[outv]" if is_last else f"[vx{i}]"
+                ax = "[outa]" if is_last else f"[ax{i}]"
+                offset = max(0.0, length - fade)
+                filter_lines.append(
+                    f"{prev_v}[v{i}]xfade=transition=fade"
+                    f":duration={fade:.3f}:offset={offset:.3f}{vx}"
+                )
+                filter_lines.append(
+                    f"{prev_a}[{i}:a]acrossfade=d={fade:.3f}{ax}"
+                )
+                length = offset + (durations or [])[i]
+                prev_v, prev_a = vx, ax
+        else:
+            # concat filter requires INTERLEAVED inputs: [v0][0:a][v1][1:a]...
+            concat_inputs = "".join(f"[v{i}][{i}:a]" for i in range(n))
+            filter_lines.append(
+                f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+            )
 
         filter_complex = ";".join(filter_lines)
 
@@ -611,14 +721,15 @@ class FFmpegEngine:
                 return False
 
         # --- Attempt 1: requested encoder ---
-        is_gpu = encoder.lower() in ("nvenc", "qsv", "amf")
-        success = _run_concat(enc_info["codec"], enc_info["args"], encoder.lower())
+        key = encoder.lower()
+        success = _run_concat(enc_info["codec"], enc_info["args"], key)
 
         # --- Attempt 2: GPU -> CPU fallback ---
-        if not success and is_gpu:
-            self._log("GPU encoding failed — falling back to CPU (libx264)...")
-            cpu_info = encoder_map["cpu"]
-            success = _run_concat(cpu_info["codec"], cpu_info["args"], "cpu (fallback)")
+        if not success and key in fallback_for:
+            fb_key = fallback_for[key]
+            fb = encoder_map[fb_key]
+            self._log(f"Hardware encoding failed — falling back to CPU ({fb['codec']})...")
+            success = _run_concat(fb["codec"], fb["args"], f"{fb_key} (fallback)")
 
         return success
 

@@ -1,23 +1,14 @@
 """
-CompilationWorker / SilenceRemovalWorker — QThread-based background workers
-that drive the Smart Video Compiler pipelines.
+Background workers for Smart Video Compiler.
 
-CompilationWorker pipeline
---------------------------
-1. Expand and scan sources (files and/or folders)      ( 0-10 %)
-2. Read full duration of each video                    (10-50 %)
-3. Plan random non-overlapping clips                   (50-55 %)
-4. Cut individual clips from source videos             (55-85 %)
-5. Concatenate clips into final video                  (85-95 %)
-6. Clean up temporary files                            (95-100 %)
+Clip compilation runs in two stages so the user can review the plan:
 
-SilenceRemovalWorker pipeline
------------------------------
-1. Validate the input media file                       ( 0- 5 %)
-2. Detect silence                                      ( 5-50 %)
-3. Cut non-silent segments                             (50-80 %)
-4. Concatenate segments                                (80-95 %)
-5. Clean up temporary files                            (95-100 %)
+1. ``ClipPlanningWorker``  — expand sources, read durations, plan random
+   clips, generate thumbnails            (progress 0-100 %)
+2. ``ClipRenderWorker``    — cut included clips, concatenate, clean up
+                                         (progress 0-100 %)
+
+``SilenceRemovalWorker`` keeps its single-stage pipeline.
 """
 
 import os
@@ -27,6 +18,7 @@ from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
+from core.clip_plan import ClipEntry, ClipSession
 from core.ffmpeg_engine import (
     FFmpegEngine,
     compiler_output_name,
@@ -38,14 +30,15 @@ from core.ffmpeg_engine import (
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv"})
 
 
-class CompilationWorker(QThread):
-    """Runs the video compilation pipeline on a background thread."""
+class ClipPlanningWorker(QThread):
+    """Stage 1: scan sources, plan random clips, generate thumbnails."""
 
-    # -- Signals ---------------------------------------------------------
+    kind = "clip-plan"
+
     log_message = Signal(str)
     phase_message = Signal(str)
     progress_percent = Signal(int)
-    encoding_complete = Signal(str)   # final output path
+    plan_ready = Signal(object)       # ClipSession
     error_occurred = Signal(str)
 
     # ------------------------------------------------------------------
@@ -56,6 +49,9 @@ class CompilationWorker(QThread):
         total_duration: int,
         clip_duration: int,
         encoder: str,
+        portrait: bool = False,
+        scene_cut: bool = False,
+        crossfade: float = 0.0,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
@@ -64,6 +60,9 @@ class CompilationWorker(QThread):
         self.total_duration = float(total_duration)
         self.clip_duration = float(clip_duration)
         self.encoder = encoder
+        self.portrait = portrait
+        self.scene_cut = scene_cut
+        self.crossfade = crossfade
 
         self.engine = FFmpegEngine()
         self.engine.log_callback = self.log_message.emit
@@ -76,7 +75,6 @@ class CompilationWorker(QThread):
 
     @staticmethod
     def _is_video_file(path: str) -> bool:
-        """Return ``True`` if *path* has a recognised video extension."""
         _, ext = os.path.splitext(path)
         return ext.lower() in VIDEO_EXTENSIONS
 
@@ -114,51 +112,28 @@ class CompilationWorker(QThread):
 
         return expanded
 
-    def _resolve_output_path(self) -> str:
-        """
-        Return a timestamped, non-colliding output path in the output folder.
-
-        Pattern: ``compiled_video_<YYYY-mm-dd_HHMMSS>.mp4`` with a numeric
-        suffix appended when a job finishes within the same second.
-        """
-        os.makedirs(self.output_folder, exist_ok=True)
-        stamp = make_timestamp()
-        base_name = compiler_output_name(stamp)
-        candidate = os.path.join(self.output_folder, f"{base_name}.mp4")
-
-        counter = 1
-        while os.path.exists(candidate):
-            candidate = os.path.join(
-                self.output_folder, f"{base_name}_{counter}.mp4"
-            )
-            counter += 1
-        return candidate
-
     # ------------------------------------------------------------------
-    # Pipeline  (called from QThread.run)
+    # Pipeline
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Main entry-point — runs the full compilation pipeline."""
-        self._temp_dir = None
-
         try:
-            self._pipeline()
+            session = self._pipeline()
+            if session is not None:
+                self.plan_ready.emit(session)
+            else:
+                self._cleanup_temp_dir()
         except Exception as exc:
             tb = traceback.format_exc()
             self.log_message.emit(f"Unexpected error: {exc}\n{tb}")
             self.error_occurred.emit(str(exc))
-        finally:
             self._cleanup_temp_dir()
 
-    def _pipeline(self) -> None:
-        # --------------------------------------------------------------
-        # 1. Scan phase (0-10 %)
-        # --------------------------------------------------------------
+    def _pipeline(self) -> Optional[ClipSession]:
+        # 1. Scan (0-15 %) -------------------------------------------------
         self.progress_percent.emit(0)
 
         video_files = self._expand_sources()
-
         if not video_files:
             msg = (
                 "No video files found in the selected sources. "
@@ -166,23 +141,25 @@ class CompilationWorker(QThread):
             )
             self.log_message.emit(msg)
             self.error_occurred.emit(msg)
-            return
+            return None
 
         self.log_message.emit(f"Found {len(video_files)} unique video file(s).")
-        self.progress_percent.emit(10)
+        self.progress_percent.emit(15)
 
         if self.isInterruptionRequested():
-            self._emit_cancelled()
-            return
+            self._cancelled()
+            return None
 
-        # --------------------------------------------------------------
-        # 2. Duration phase (10-50 %)
-        # --------------------------------------------------------------
+        # 2. Durations (+ optional scenes) (15-55 %) -----------------------
         self.phase_message.emit("Analyzing videos...")
         videos_segments: dict[str, list[tuple[float, float]]] = {}
-        total_videos = len(video_files)
+        scene_times: dict[str, list[float]] = {}
 
         for idx, video_path in enumerate(video_files):
+            if self.isInterruptionRequested():
+                self._cancelled()
+                return None
+
             filename = os.path.basename(video_path)
             duration = self.engine.get_video_duration(video_path)
             if duration > 1.0:
@@ -194,113 +171,218 @@ class CompilationWorker(QThread):
                     f"Warning: \"{filename}\" too short ({duration:.1f}s), skipping."
                 )
 
-            progress = 10 + int((idx + 1) / total_videos * 40)
+            if self.scene_cut and duration > 1.0:
+                cuts = self.engine.detect_scene_changes(video_path)
+                scene_times[video_path] = cuts
+                if cuts:
+                    self.log_message.emit(
+                        f"{len(cuts)} scene change(s) in \"{filename}\""
+                    )
+
+            progress = 15 + int((idx + 1) / len(video_files) * 40)
             self.progress_percent.emit(progress)
 
-        if self.isInterruptionRequested():
-            self._emit_cancelled()
-            return
-
-        # --------------------------------------------------------------
-        # 3. Clip planning phase (50-55 %)
-        # --------------------------------------------------------------
+        # 3. Plan clips (55-65 %) ------------------------------------------
         self.phase_message.emit("Planning random clips...")
-        self.progress_percent.emit(50)
-        self.log_message.emit("Planning random clips...")
+        self.progress_percent.emit(55)
 
         self._temp_dir = tempfile.mkdtemp(prefix="svc_")
 
-        planned_clips = self.engine.extract_random_clips(
+        selected, candidates_by_video = self.engine.plan_clips(
             videos_segments=videos_segments,
             clip_duration=self.clip_duration,
             total_target=self.total_duration,
             temp_dir=self._temp_dir,
-            log_callback=None,
+            scene_times=scene_times,
         )
 
-        if not planned_clips:
+        if not selected:
             msg = (
                 "Could not plan any clips from the selected sources. "
                 "The video(s) may be too short."
             )
             self.log_message.emit(msg)
             self.error_occurred.emit(msg)
-            return
+            self._cleanup_temp_dir()
+            return None
 
-        total_planned = len(planned_clips)
-        source_videos = len({c["video"] for c in planned_clips})
-        self.log_message.emit(
-            f"Planned {total_planned} clip(s) from {source_videos} video(s)."
+        self.progress_percent.emit(65)
+
+        # 4. Thumbnails (65-100 %) -----------------------------------------
+        self.phase_message.emit("Generating previews...")
+        session = ClipSession(
+            target_total=self.total_duration,
+            temp_dir=self._temp_dir,
+            portrait=self.portrait,
+            encoder=self.encoder,
+            output_folder=self.output_folder,
+            crossfade=self.crossfade,
         )
-        self.progress_percent.emit(55)
+        session.candidates_by_video = candidates_by_video
 
-        if self.isInterruptionRequested():
-            self._emit_cancelled()
+        total = len(selected)
+        for idx, item in enumerate(selected):
+            entry = ClipEntry(
+                video=item["video"],
+                start=item["start"],
+                duration=item["duration"],
+                thumb_path=os.path.join(self._temp_dir, f"thumb_{idx:03d}.jpg"),
+            )
+            mid = entry.start + entry.duration / 2
+            self.phase_message.emit(f"Generating previews ({idx + 1}/{total})...")
+            self.engine.generate_thumbnail(
+                entry.video, mid, entry.thumb_path, portrait=self.portrait
+            )
+            session.clips.append(entry)
+
+            progress = 65 + int((idx + 1) / total * 35)
+            self.progress_percent.emit(progress)
+
+        self.log_message.emit(
+            f"Planned {total} clip(s) — review them before rendering."
+        )
+        self.progress_percent.emit(100)
+        return session
+
+    # ------------------------------------------------------------------
+    def _cancelled(self) -> None:
+        self.log_message.emit("Cancelled by user.")
+        self.error_occurred.emit("Cancelled by user.")
+
+    def _cleanup_temp_dir(self) -> None:
+        if self._temp_dir and os.path.isdir(self._temp_dir):
+            self.engine.cleanup_temp(self._temp_dir)
+            self._temp_dir = None
+
+
+class ClipRenderWorker(QThread):
+    """Stage 2: cut the reviewed clips and encode the final video."""
+
+    kind = "clip-render"
+
+    log_message = Signal(str)
+    phase_message = Signal(str)
+    progress_percent = Signal(int)
+    encoding_complete = Signal(str)
+    error_occurred = Signal(str)
+
+    # ------------------------------------------------------------------
+    def __init__(
+        self,
+        session: ClipSession,
+        parent: Optional[object] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.session = session
+        self.engine = FFmpegEngine()
+        self.engine.log_callback = self.log_message.emit
+
+    # ------------------------------------------------------------------
+    def _resolve_output_path(self) -> str:
+        os.makedirs(self.session.output_folder, exist_ok=True)
+        stamp = make_timestamp()
+        base_name = compiler_output_name(stamp)
+        candidate = os.path.join(self.session.output_folder, f"{base_name}.mp4")
+
+        counter = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(
+                self.session.output_folder, f"{base_name}_{counter}.mp4"
+            )
+            counter += 1
+        return candidate
+
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        try:
+            self._pipeline()
+        except Exception as exc:
+            tb = traceback.format_exc()
+            self.log_message.emit(f"Unexpected error: {exc}\n{tb}")
+            self.error_occurred.emit(str(exc))
+        finally:
+            self.engine.cleanup_temp(self.session.temp_dir)
+
+    def _pipeline(self) -> None:
+        clips = [c for c in self.session.clips if not c.excluded]
+        if not clips:
+            msg = "No clips were selected for rendering."
+            self.log_message.emit(msg)
+            self.error_occurred.emit(msg)
             return
 
-        # --------------------------------------------------------------
-        # 4. Clip cutting phase (55-85 %)
-        # --------------------------------------------------------------
-        extracted_paths: list[str] = []
+        # 1. Cut clips (0-70 %) --------------------------------------------
+        extracted: list[str] = []
+        durations: list[float] = []
+        renumbered: dict[int, str] = {}
+        render_index = 0
 
-        for idx, clip in enumerate(planned_clips):
+        for idx, clip in enumerate(clips):
             if self.isInterruptionRequested():
-                self._emit_cancelled()
+                self._cancelled()
                 return
 
-            clip_number = idx + 1
-            filename = os.path.basename(clip["video"])
-            start_s = clip["start"]
-            duration_s = clip["duration"]
+            render_index += 1
+            filename = os.path.basename(clip.video)
 
-            self.phase_message.emit(
-                f"Cutting clips ({clip_number}/{total_planned})..."
-            )
+            # Re-map planned output name to a contiguous numbering so the
+            # concat order matches the reviewed order even after exclusions.
+            new_output = renumbered.get(idx)
+            if new_output is None:
+                new_output = os.path.join(
+                    self.session.temp_dir, f"render_{render_index:03d}.mkv"
+                )
+                renumbered[idx] = new_output
+
+            self.phase_message.emit(f"Cutting clips ({render_index}/{len(clips)})...")
             self.log_message.emit(
-                f"Extracting clip [{clip_number}/{total_planned}]: "
-                f"\"{filename}\" {start_s:.1f}s-{start_s + duration_s:.1f}s"
+                f"Extracting clip [{render_index}/{len(clips)}]: "
+                f"\"{filename}\" {clip.start:.1f}s-{clip.end:.1f}s"
             )
 
             success = self.engine.cut_clip(
-                video_path=clip["video"],
-                start=start_s,
-                duration=duration_s,
-                output_path=clip["output"],
+                video_path=clip.video,
+                start=clip.start,
+                duration=clip.duration,
+                output_path=new_output,
             )
-
             if success:
-                extracted_paths.append(clip["output"])
+                extracted.append(new_output)
+                durations.append(clip.duration)
             else:
                 self.log_message.emit(
-                    f"Warning: failed to extract clip [{clip_number}/{total_planned}], skipping."
+                    f"Warning: failed to extract clip [{render_index}/{len(clips)}], skipping."
                 )
 
-            progress = 55 + int((idx + 1) / total_planned * 30)
+            progress = int((idx + 1) / len(clips) * 70)
             self.progress_percent.emit(progress)
 
-        if not extracted_paths:
+        if not extracted:
             msg = "No clips were successfully extracted. Aborting."
             self.log_message.emit(msg)
             self.error_occurred.emit(msg)
             return
 
-        # --------------------------------------------------------------
-        # 5. Concatenation phase (85-95 %)
-        # --------------------------------------------------------------
+        # 2. Concat & encode (70-95 %) --------------------------------------
         self.phase_message.emit("Concatenating & encoding...")
-        self.progress_percent.emit(85)
+        self.progress_percent.emit(70)
 
         output_path = self._resolve_output_path()
-        self.log_message.emit(f"Encoding final video with \"{self.encoder}\" encoder...")
+        self.log_message.emit(
+            f"Encoding final video with \"{self.session.encoder}\" encoder..."
+        )
 
         if self.isInterruptionRequested():
-            self._emit_cancelled()
+            self._cancelled()
             return
 
         concat_ok = self.engine.concat_clips(
-            clip_paths=extracted_paths,
+            clip_paths=extracted,
             output_path=output_path,
-            encoder=map_encoder_display(self.encoder),
+            encoder=map_encoder_display(self.session.encoder),
+            durations=durations if self.session.crossfade > 0 else None,
+            aspect="portrait" if self.session.portrait else "landscape",
+            crossfade=self.session.crossfade,
         )
 
         if not concat_ok:
@@ -312,24 +394,15 @@ class CompilationWorker(QThread):
         self.log_message.emit(f"Successfully created \"{output_path}\"")
         self.progress_percent.emit(95)
 
-        # --------------------------------------------------------------
-        # 6. Cleanup (95-100 %)
-        # --------------------------------------------------------------
+        # 3. Cleanup (95-100 %) ---------------------------------------------
         self.phase_message.emit("Cleaning up...")
-        self._cleanup_temp_dir()
         self.progress_percent.emit(100)
         self.encoding_complete.emit(output_path)
 
     # ------------------------------------------------------------------
-    def _emit_cancelled(self) -> None:
+    def _cancelled(self) -> None:
         self.log_message.emit("Cancelled by user.")
         self.error_occurred.emit("Cancelled by user.")
-
-    def _cleanup_temp_dir(self) -> None:
-        """Remove the temporary directory if it exists."""
-        if self._temp_dir and os.path.isdir(self._temp_dir):
-            self.engine.cleanup_temp(self._temp_dir)
-            self._temp_dir = None
 
 
 class SilenceRemovalWorker(QThread):
@@ -338,6 +411,8 @@ class SilenceRemovalWorker(QThread):
     Takes a single media file, detects silent regions, cuts out all
     non-silent segments, and concatenates them into a single output file.
     """
+
+    kind = "silence"
 
     log_message = Signal(str)
     phase_message = Signal(str)

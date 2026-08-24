@@ -1,10 +1,18 @@
 """
 Smart Video Compiler — Entry Point
 ==================================
-Launches the PySide6 UI and wires it to the CompilationWorker and
-SilenceRemovalWorker background threads.
+Launches the PySide6 UI and wires it to the background workers.
+
+Job flow
+--------
+* ``plan_requested``      → ClipPlanningWorker (always launched immediately)
+* ``render_requested``    → ClipRenderWorker  (queued when busy)
+* ``silence_removal_requested`` → SilenceRemovalWorker (queued when busy)
+
+Every finished/failed job is written to the on-disk history file.
 """
 
+import os
 import sys
 
 from PySide6.QtCore import Qt, QSettings
@@ -12,12 +20,17 @@ from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import QApplication
 
 from ui.main_window import MainWindow
+from core import history
 from core.ffmpeg_engine import FFmpegEngine
-from core.worker import CompilationWorker, SilenceRemovalWorker
+from core.worker import (
+    ClipPlanningWorker,
+    ClipRenderWorker,
+    SilenceRemovalWorker,
+)
 
 
 class Application:
-    """Holds the top-level window and active worker reference."""
+    """Holds the top-level window, the active worker and the job queue."""
 
     def __init__(self) -> None:
         self.app = QApplication(sys.argv)
@@ -34,11 +47,17 @@ class Application:
         self._apply_ffmpeg_override()
 
         self.window = MainWindow()
-        self._worker: CompilationWorker | SilenceRemovalWorker | None = None
+        self._worker: (
+            ClipPlanningWorker | ClipRenderWorker | SilenceRemovalWorker | None
+        ) = None
+        self._queue: list = []
 
-        # Wire UI signals to their handlers
-        self.window.compilation_requested.connect(self._on_compilation_requested)
-        self.window.silence_removal_requested.connect(self._on_silence_removal_requested)
+        self.window.plan_requested.connect(self._on_plan_requested)
+        self.window.render_requested.connect(self._on_render_requested)
+        self.window.discard_session_requested.connect(self._on_discard_session)
+        self.window.silence_removal_requested.connect(
+            self._on_silence_removal_requested
+        )
         self.window.cancellation_requested.connect(self._on_cancellation_requested)
         self.window.ffmpeg_override_changed.connect(self._on_ffmpeg_override_changed)
 
@@ -53,30 +72,110 @@ class Application:
 
     # ------------------------------------------------------------------
     def _on_ffmpeg_override_changed(self, directory: str) -> None:
-        """Apply a new FFmpeg location and refresh GPU detection."""
         FFmpegEngine.default_binary_dir = directory or None
         self.window.start_detection()
 
     # ------------------------------------------------------------------
-    def _on_compilation_requested(
+    # Job submission
+    # ------------------------------------------------------------------
+
+    def _submit(self, worker) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._queue.append(worker)
+            self.window.update_queue_count(len(self._queue))
+            self.window.begin_job(worker.kind)
+            self.window.append_log(
+                f"Job queued (position {len(self._queue)})."
+            )
+        else:
+            self._launch(worker)
+
+    def _launch(self, worker) -> None:
+        self._worker = worker
+        worker.log_message.connect(self.window.append_log)
+        worker.phase_message.connect(self.window.set_phase)
+        worker.progress_percent.connect(self.window.update_progress)
+        if hasattr(worker, "plan_ready"):
+            worker.plan_ready.connect(self.window.on_plan_ready)
+        else:
+            worker.encoding_complete.connect(self._on_job_complete)
+        worker.error_occurred.connect(self._on_job_error)
+        worker.finished.connect(self._on_worker_finished)
+        self.window.begin_job(worker.kind)
+        worker.start()
+
+    # ------------------------------------------------------------------
+    def _on_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is not None:
+            worker.deleteLater()
+        if self._worker is worker:
+            self._worker = None
+
+        if self._queue:
+            nxt = self._queue.pop(0)
+            self.window.update_queue_count(len(self._queue))
+            self._launch(nxt)
+
+    # ------------------------------------------------------------------
+    def _record_history(self, worker, output_path: str, ok: bool) -> None:
+        summary = os.path.basename(output_path) if output_path else ""
+        history.append_entry(
+            mode=worker.kind.replace("-", " ").title(),
+            summary=summary,
+            output_path=output_path,
+            ok=ok,
+        )
+
+    def _on_job_complete(self, output_path: str) -> None:
+        worker = self._worker
+        if worker is not None:
+            self._record_history(worker, output_path, ok=True)
+        self.window.on_compilation_finished(output_path)
+
+    def _on_job_error(self, error_message: str) -> None:
+        worker = self._worker
+        cancelled = error_message.strip() == "Cancelled by user."
+        if worker is not None and not cancelled:
+            self._record_history(worker, "", ok=False)
+        self.window.on_compilation_error(error_message)
+
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
+
+    def _on_plan_requested(
         self,
         sources: list[tuple[str, str]],
         output_folder: str,
         total_duration: int,
         clip_duration: int,
         encoder: str,
+        portrait: bool,
+        scene_cut: bool,
+        crossfade: float,
     ) -> None:
-        """Create and launch a CompilationWorker (random clip mode)."""
-        self._worker = CompilationWorker(
-            sources=sources,
-            output_folder=output_folder,
-            total_duration=total_duration,
-            clip_duration=clip_duration,
-            encoder=encoder,
+        self._submit(
+            ClipPlanningWorker(
+                sources=sources,
+                output_folder=output_folder,
+                total_duration=total_duration,
+                clip_duration=clip_duration,
+                encoder=encoder,
+                portrait=portrait,
+                scene_cut=scene_cut,
+                crossfade=crossfade,
+            )
         )
-        self._start_worker()
 
-    # ------------------------------------------------------------------
+    def _on_render_requested(self, session) -> None:
+        self._submit(ClipRenderWorker(session=session))
+
+    def _on_discard_session(self, session) -> None:
+        engine = FFmpegEngine()
+        engine.log_callback = self.window.append_log
+        engine.cleanup_temp(session.temp_dir)
+
     def _on_silence_removal_requested(
         self,
         video_path: str,
@@ -86,46 +185,23 @@ class Application:
         min_duration: float,
         padding: float,
     ) -> None:
-        """Create and launch a SilenceRemovalWorker (single-file mode)."""
-        self._worker = SilenceRemovalWorker(
-            video_path=video_path,
-            output_folder=output_folder,
-            encoder=encoder,
-            threshold_db=threshold_db,
-            min_duration=min_duration,
-            padding=padding,
+        self._submit(
+            SilenceRemovalWorker(
+                video_path=video_path,
+                output_folder=output_folder,
+                encoder=encoder,
+                threshold_db=threshold_db,
+                min_duration=min_duration,
+                padding=padding,
+            )
         )
-        self._start_worker()
 
-    # ------------------------------------------------------------------
     def _on_cancellation_requested(self) -> None:
-        """Request interruption of the running worker."""
         if self._worker is not None and self._worker.isRunning():
             self._worker.requestInterruption()
 
     # ------------------------------------------------------------------
-    def _start_worker(self) -> None:
-        """Wire common worker signals to UI slots and start the thread."""
-        if self._worker is None:
-            return
-        self._worker.log_message.connect(self.window.append_log)
-        self._worker.phase_message.connect(self.window.set_phase)
-        self._worker.progress_percent.connect(self.window.update_progress)
-        self._worker.encoding_complete.connect(self.window.on_compilation_finished)
-        self._worker.error_occurred.connect(self.window.on_compilation_error)
-        self._worker.finished.connect(self._cleanup_worker)
-        self._worker.start()
-
-    # ------------------------------------------------------------------
-    def _cleanup_worker(self) -> None:
-        """Release the worker after thread completion."""
-        if self._worker is not None:
-            self._worker.deleteLater()
-            self._worker = None
-
-    # ------------------------------------------------------------------
     def run(self) -> int:
-        """Show the window and enter the Qt event loop."""
         self.window.show()
         return self.app.exec()
 
