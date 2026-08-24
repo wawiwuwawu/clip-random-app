@@ -8,8 +8,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QDialog,
-    QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -25,10 +23,15 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+)
+
+from ui.widgets import (
+    NoWheelComboBox,
+    NoWheelDoubleSpinBox,
+    NoWheelSpinBox,
 )
 
 from core.ffmpeg_engine import (
@@ -480,21 +483,21 @@ class MainWindow(QMainWindow):
     content_stack: QStackedWidget
     source_list: SourceListWidget
     output_folder_edit: FolderDropLineEdit
-    total_duration_spin: QSpinBox
-    clip_duration_spin: QSpinBox
-    aspect_combo: QComboBox
+    total_duration_spin: NoWheelSpinBox
+    clip_duration_spin: NoWheelSpinBox
+    aspect_combo: NoWheelComboBox
     scene_check: QPushButton
     fade_check: QPushButton
-    encoder_combo: QComboBox
+    encoder_combo: NoWheelComboBox
     encoder_warning: QLabel
     detected_label: QLabel
     preview_label: QLabel
     queue_status_label: QLabel
     silence_drop_zone: DropZone
     silence_file_edit: QLineEdit
-    threshold_spin: QSpinBox
-    min_duration_spin: QDoubleSpinBox
-    padding_spin: QDoubleSpinBox
+    threshold_spin: NoWheelSpinBox
+    min_duration_spin: NoWheelDoubleSpinBox
+    padding_spin: NoWheelDoubleSpinBox
     compile_button: QPushButton
     silence_button: QPushButton
     cancel_button: QPushButton
@@ -680,7 +683,7 @@ class MainWindow(QMainWindow):
         total_label = QLabel("Total Compilation Duration")
         total_label.setObjectName("field-label")
         total_label.setFixedWidth(160)
-        self.total_duration_spin = QSpinBox()
+        self.total_duration_spin = NoWheelSpinBox()
         self.total_duration_spin.setRange(1, 10)
         self.total_duration_spin.setSuffix(" min")
         self.total_duration_spin.setValue(5)
@@ -689,7 +692,7 @@ class MainWindow(QMainWindow):
         clip_label = QLabel("Duration per Clip")
         clip_label.setObjectName("field-label")
         clip_label.setFixedWidth(160)
-        self.clip_duration_spin = QSpinBox()
+        self.clip_duration_spin = NoWheelSpinBox()
         self.clip_duration_spin.setRange(1, 60)
         self.clip_duration_spin.setSuffix(" sec")
         self.clip_duration_spin.setValue(10)
@@ -698,7 +701,7 @@ class MainWindow(QMainWindow):
         aspect_label = QLabel("Aspect")
         aspect_label.setObjectName("field-label")
         aspect_label.setFixedWidth(160)
-        self.aspect_combo = QComboBox()
+        self.aspect_combo = NoWheelComboBox()
         self.aspect_combo.addItem(ASPECT_LANDSCAPE)
         self.aspect_combo.addItem(ASPECT_PORTRAIT)
         self.aspect_combo.setFixedWidth(260)
@@ -793,7 +796,7 @@ class MainWindow(QMainWindow):
         threshold_label = QLabel("Threshold (dB)")
         threshold_label.setObjectName("field-label")
         threshold_label.setFixedWidth(160)
-        self.threshold_spin = QSpinBox()
+        self.threshold_spin = NoWheelSpinBox()
         self.threshold_spin.setRange(-60, 0)
         self.threshold_spin.setSuffix(" dB")
         self.threshold_spin.setValue(-30)
@@ -802,7 +805,7 @@ class MainWindow(QMainWindow):
         min_dur_label = QLabel("Minimum Duration (s)")
         min_dur_label.setObjectName("field-label")
         min_dur_label.setFixedWidth(160)
-        self.min_duration_spin = QDoubleSpinBox()
+        self.min_duration_spin = NoWheelDoubleSpinBox()
         self.min_duration_spin.setRange(0.1, 10.0)
         self.min_duration_spin.setSuffix(" s")
         self.min_duration_spin.setValue(0.5)
@@ -813,7 +816,7 @@ class MainWindow(QMainWindow):
         padding_label = QLabel("Padding (s)")
         padding_label.setObjectName("field-label")
         padding_label.setFixedWidth(160)
-        self.padding_spin = QDoubleSpinBox()
+        self.padding_spin = NoWheelDoubleSpinBox()
         self.padding_spin.setRange(0.0, 5.0)
         self.padding_spin.setSuffix(" s")
         self.padding_spin.setValue(0.0)
@@ -866,7 +869,7 @@ class MainWindow(QMainWindow):
         encoder_label = QLabel("Hardware Encoder")
         encoder_label.setObjectName("field-label")
         encoder_label.setFixedWidth(160)
-        self.encoder_combo = QComboBox()
+        self.encoder_combo = NoWheelComboBox()
         self.encoder_combo.addItem(AUTO_ENCODER_LABEL)
         self.encoder_combo.addItems(ENCODER_CHOICES)
         self.encoder_combo.setCurrentIndex(0)
