@@ -444,6 +444,7 @@ class SilenceRemovalWorker(QThread):
         self.padding = padding
         self.denoise = denoise or {}
         self.subtitle = subtitle or {}
+        self.subtitle_result: Optional[dict] = None
 
         self.engine = FFmpegEngine()
         self.engine.log_callback = self.log_message.emit
@@ -665,14 +666,19 @@ class SilenceRemovalWorker(QThread):
         self.encoding_complete.emit(out_path)
 
     # ------------------------------------------------------------------
-    def _generate_subtitles(self, output_path: str) -> None:
+    def _generate_subtitles(self, output_path: str) -> dict:
         """Transcribe the FINAL output file so SRT timing matches it."""
+        result = {"ok": False, "reason": "", "srt": ""}
+
         if not subtitles_mod.is_available():
-            self.log_message.emit(
-                "Subtitles skipped — faster-whisper is not installed.\n"
+            reason = (
+                "faster-whisper is not installed. "
                 "Install with: pip install faster-whisper"
             )
-            return
+            self.log_message.emit("Subtitles skipped — " + reason)
+            result["reason"] = reason
+            self.subtitle_result = result
+            return result
 
         srt_path = os.path.splitext(output_path)[0] + ".srt"
         try:
@@ -685,15 +691,24 @@ class SilenceRemovalWorker(QThread):
                 log=self.log_message.emit,
                 status_cb=self.phase_message.emit,
                 progress_cb=lambda frac: self.progress_percent.emit(
-                    70 + int(max(0.0, min(1.0, frac)) * 22)
+                    -1 if frac < 0 else 84 + int(min(1.0, max(0.0, frac)) * 8)
+                ),
+                dl_progress_cb=lambda frac: self.progress_percent.emit(
+                    70 + int(min(1.0, max(0.0, frac)) * 8)
                 ),
             )
             self.log_message.emit(
                 f"Subtitles saved: \"{os.path.basename(srt_path)}\" "
                 f"({count} cue(s), language={detected or '?'})"
             )
+            result.update(ok=True, srt=srt_path)
         except Exception as exc:
-            self.log_message.emit(f"Subtitle generation failed: {exc}")
+            reason = str(exc)
+            self.log_message.emit(f"Subtitle generation failed: {reason}")
+            result["reason"] = reason
+
+        self.subtitle_result = result
+        return result
 
     # ------------------------------------------------------------------
     def _emit_cancelled(self) -> None:

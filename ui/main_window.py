@@ -1960,6 +1960,7 @@ class MainWindow(QMainWindow):
         """Mark a job as started. Only one owner drives the progress UI."""
         if self._busy_owner is None:
             self._busy_owner = kind
+            self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
             self.progress_bar.setVisible(True)
             self.cancel_button.setVisible(True)
@@ -2104,17 +2105,32 @@ class MainWindow(QMainWindow):
         )
 
     def update_progress(self, percent: int) -> None:
+        if percent < 0:
+            # Busy / indeterminate (e.g. model download without size info)
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setVisible(True)
+            return
+        if self.progress_bar.maximum() != 100:
+            self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(max(0, min(100, percent)))
         if not self.progress_bar.isVisible():
             self.progress_bar.setVisible(True)
 
-    def on_compilation_finished(self, output_path: str) -> None:
+    def on_compilation_finished(
+        self, output_path: str, subtitle_result: dict | None = None
+    ) -> None:
         self.end_job()
         self.append_log(f"Finished: {output_path}")
 
         srt_path = os.path.splitext(output_path)[0] + ".srt"
         body = f"Saved to:\n{output_path}"
-        if Path(srt_path).is_file():
+        warning_line = ""
+
+        if subtitle_result and not subtitle_result.get("ok"):
+            reason = subtitle_result.get("reason") or "unknown error"
+            warning_line = f"\u26a0 Subtitles FAILED: {reason}"
+            body += "\n\n" + warning_line
+        elif Path(srt_path).is_file():
             body += f"\n\nSubtitles:\n{srt_path}"
 
         box = QMessageBox(self)
@@ -2130,6 +2146,10 @@ class MainWindow(QMainWindow):
                 os.startfile(folder)
             except OSError as exc:
                 self.append_log(f"Could not open folder \"{folder}\": {exc}")
+
+        if warning_line:
+            self.status_label.setStyleSheet("color: #FF9800;")
+            self.status_label.setText("Done \u2014 but subtitles failed (see dialog/log).")
 
     def on_compilation_error(self, error_message: str) -> None:
         cancelled = error_message.strip() == "Cancelled by user."

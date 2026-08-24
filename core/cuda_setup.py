@@ -26,6 +26,10 @@ PINNED_PACKAGES = [
 _KEY_DLLS = ("cudnn64_9.dll", "cublas64_12.dll", "cublasLt64_12.dll")
 
 
+class _DownloadCancelled(Exception):
+    pass
+
+
 def cuda_bin_dir() -> Path:
     directory = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")))
     directory = directory / "SmartVideoCompiler" / "cuda" / "bin"
@@ -44,7 +48,7 @@ def _dlls_present(directory: Path) -> bool:
     return all((directory / dll).is_file() for dll in _KEY_DLLS)
 
 
-def ensure_cuda_libs(log_cb=None, progress_cb=None) -> bool:
+def ensure_cuda_libs(log_cb=None, progress_cb=None, cancel_check=None) -> bool:
     """
     Make cuBLAS/cuDNN DLLs available. Returns True when the directories are
     registered (GPU load may still fail for unrelated driver reasons).
@@ -66,6 +70,9 @@ def ensure_cuda_libs(log_cb=None, progress_cb=None) -> bool:
     try:
         target.mkdir(parents=True, exist_ok=True)
         for index, (package, version) in enumerate(PINNED_PACKAGES):
+            if cancel_check and cancel_check():
+                log("CUDA download cancelled.")
+                return False
             url, size = _resolve_wheel(package, version)
             label = package
             base_fraction = index / len(PINNED_PACKAGES)
@@ -74,9 +81,13 @@ def ensure_cuda_libs(log_cb=None, progress_cb=None) -> bool:
             archive_path = Path(tempfile.gettempdir()) / f"svc_{Path(url).name}"
             _download(url, archive_path, size,
                       lambda frac, b=base_fraction, s=span, l=label:
-                      report(b + frac * s, l))
+                      report(b + frac * s, l),
+                      cancel_check=cancel_check)
             _extract_dlls(archive_path, target)
             archive_path.unlink(missing_ok=True)
+    except _DownloadCancelled:
+        log("CUDA download cancelled.")
+        return False
     except Exception as exc:
         log(f"CUDA auto-setup failed ({exc}) — using CPU instead.")
         return False
@@ -104,13 +115,15 @@ def _resolve_wheel(package: str, version: str) -> tuple[str, int | None]:
 
 
 def _download(url: str, destination: Path, expected_size: int | None,
-              progress) -> None:
+              progress, cancel_check=None) -> None:
     block = 1024 * 256
     downloaded = 0
     with urllib.request.urlopen(url, timeout=60) as response, \
             open(destination, "wb") as handle:
         total = expected_size or int(response.headers.get("Content-Length") or 0)
         while True:
+            if cancel_check and cancel_check():
+                raise _DownloadCancelled()
             chunk = response.read(block)
             if not chunk:
                 break

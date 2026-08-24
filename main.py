@@ -130,9 +130,10 @@ class Application:
 
     def _on_job_complete(self, output_path: str) -> None:
         worker = self._worker
+        subtitle_result = getattr(worker, "subtitle_result", None)
         if worker is not None:
             self._record_history(worker, output_path, ok=True)
-        self.window.on_compilation_finished(output_path)
+        self.window.on_compilation_finished(output_path, subtitle_result)
 
     def _on_job_error(self, error_message: str) -> None:
         worker = self._worker

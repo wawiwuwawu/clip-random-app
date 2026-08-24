@@ -32,6 +32,9 @@ SUPPORTED_LANGUAGES = {
     "Spanish": "es",
 }
 
+MODEL_SIZES_MB = {"tiny": 75, "base": 145, "small": 461, "medium": 1531}
+_MODEL_REPO_PREFIX = "Systran/faster-whisper-"
+
 
 def app_data_dir() -> Path:
     directory = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")))
@@ -56,22 +59,57 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def _load_model(model_size: str, log) -> object:
+def _load_model(
+    model_size: str,
+    log,
+    dl_progress_cb=None,
+    status_cb=None,
+    cancel_check=None,
+) -> object:
     from core.cuda_setup import ensure_cuda_libs
 
     from faster_whisper import WhisperModel
 
-    if ensure_cuda_libs(log_cb=log):
+    log = log or (lambda msg: None)
+    status_cb = status_cb or (lambda msg: None)
+    dl_progress_cb = dl_progress_cb or (lambda fraction: None)
+
+    status_cb("Checking CUDA libraries...")
+    if ensure_cuda_libs(log_cb=log, progress_cb=dl_progress_cb,
+                        cancel_check=cancel_check):
         try:
             model = WhisperModel(model_size, device="cuda", compute_type="float16")
             log(f"Whisper backend: CUDA float16 (model={model_size})")
             return model
         except Exception as exc:
             log(f"CUDA load failed ({exc.__class__.__name__}) — using CPU.")
+    else:
+        log("CUDA unavailable — using CPU.")
+
+    if not _model_cached(model_size):
+        size_mb = MODEL_SIZES_MB.get(model_size)
+        msg = (
+            f"Downloading Whisper model \"{model_size}\" "
+            f"(~{size_mb} MB, one time only)..."
+            if size_mb else
+            f"Downloading Whisper model \"{model_size}\" (one time only)..."
+        )
+        status_cb(msg)
+        log(msg)
+        progress_cb(-1)  # busy indicator
 
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     log(f"Whisper backend: CPU int8 (model={model_size})")
     return model
+
+
+def _model_cached(model_size: str) -> bool:
+    """True when the HF snapshot for this model already exists locally."""
+    try:
+        from huggingface_hub import snapshot_exists
+        return snapshot_exists(_MODEL_REPO_PREFIX + model_size)
+    except Exception:
+        return False
 
 
 def transcribe_to_srt(
@@ -83,9 +121,14 @@ def transcribe_to_srt(
     cancel_check=None,
     log=None,
     status_cb=None,
+    dl_progress_cb=None,
 ) -> tuple[int, str | None]:
     """
     Transcribe *media_path* and write an SRT file to *srt_path*.
+
+    ``progress_cb`` receives segment completion as 0..1, and ``-1`` while a
+    download is in progress (busy indicator). ``dl_progress_cb`` receives
+    CUDA library download fraction as 0..1.
 
     Returns ``(cue_count, detected_language_or_None)``.
     Raises RuntimeError when faster-whisper is not installed.
@@ -104,7 +147,12 @@ def transcribe_to_srt(
         lang_code = language  # allow raw codes too
 
     status_cb("Loading speech model...")
-    model = _load_model(model_size, log)
+    model = _load_model(
+        model_size, log,
+        dl_progress_cb=dl_progress_cb,
+        status_cb=status_cb,
+        cancel_check=cancel_check,
+    )
 
     status_cb("Transcribing audio...")
     segments, info = model.transcribe(
