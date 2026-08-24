@@ -44,7 +44,13 @@ from core.ffmpeg_engine import (
     silence_output_name,
 )
 from core import history
-from core.subtitles import SUPPORTED_LANGUAGES
+from core import subtitles as subtitles_mod
+from core.subtitles import (
+    SUPPORTED_LANGUAGES,
+    MODEL_SIZES_MB,
+    is_model_cached,
+    resolve_bundled_model,
+)
 from ui.clip_preview import ClipPreviewDialog
 from ui.history_dialog import HistoryDialog
 
@@ -336,6 +342,23 @@ class GpuDetectWorker(QThread):
         self.detected.emit(key)
 
 
+class ModelDownloadWorker(QThread):
+    """Fetches a Whisper model snapshot into the local HF cache."""
+
+    finished_ok = Signal(bool, str)
+
+    def __init__(self, model_size: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.model_size = model_size
+
+    def run(self) -> None:
+        try:
+            ok = subtitles_mod.download_model(self.model_size)
+            self.finished_ok.emit(ok, "" if ok else "cancelled")
+        except Exception as exc:
+            self.finished_ok.emit(False, str(exc))
+
+
 class SettingsDialog(QDialog):
     """Application settings: FFmpeg location and default output folder."""
 
@@ -535,6 +558,8 @@ class MainWindow(QMainWindow):
         self._settings_reset_requested = False
         self._loading = False
         self._queued_count = 0
+        self._model_downloading = False
+        self._model_dl_worker: ModelDownloadWorker | None = None
 
         self._build_ui()
         self._apply_stylesheet()
@@ -542,6 +567,7 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._update_output_preview()
         self._restore_status_label()
+        self._refresh_subtitle_model_status()
 
         QTimer.singleShot(250, self.start_detection)
 
@@ -912,6 +938,22 @@ class MainWindow(QMainWindow):
         params_grid.addWidget(self.subtitle_model_combo, 7, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         params_grid.addWidget(subtitle_lang_label, 8, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         params_grid.addWidget(self.subtitle_lang_combo, 8, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        status_row = QWidget()
+        status_layout = QHBoxLayout(status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(10)
+        self.subtitle_status_label = QLabel("")
+        self.subtitle_status_label.setObjectName("hint-label")
+        self.subtitle_download_button = QPushButton("Download")
+        self.subtitle_download_button.setObjectName("secondary-button")
+        self.subtitle_download_button.setFixedWidth(110)
+        self.subtitle_download_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.subtitle_download_button.clicked.connect(self._download_subtitle_model)
+        status_layout.addWidget(self.subtitle_status_label)
+        status_layout.addWidget(self.subtitle_download_button)
+        status_layout.addStretch()
+        params_grid.addWidget(status_row, 9, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.subtitle_hint = QLabel(
             "Transcribes the FINAL file so timings match. First use downloads "
@@ -1510,6 +1552,9 @@ class MainWindow(QMainWindow):
         self.aspect_combo.currentTextChanged.connect(lambda _: self._save_settings())
         self.scene_check.toggled.connect(lambda _: self._save_settings())
         self.fade_check.toggled.connect(lambda _: self._save_settings())
+        self.subtitle_model_combo.currentTextChanged.connect(
+            lambda _: self._on_subtitle_model_changed()
+        )
         self.threshold_spin.valueChanged.connect(lambda _: self._save_settings())
         self.min_duration_spin.valueChanged.connect(lambda _: self._save_settings())
         self.padding_spin.valueChanged.connect(lambda _: self._save_settings())
@@ -1526,6 +1571,12 @@ class MainWindow(QMainWindow):
         if not self._loading:
             self._save_settings()
 
+    def _on_subtitle_model_changed(self) -> None:
+        if self._loading:
+            return
+        self._save_settings()
+        self._refresh_subtitle_model_status()
+
     def _on_noise_toggled(self, checked: bool) -> None:
         self._set_noise_controls_visible(checked)
         if not self._loading:
@@ -1536,15 +1587,85 @@ class MainWindow(QMainWindow):
         if not self._loading:
             self._save_settings()
 
+    def _refresh_subtitle_model_status(self) -> None:
+        size = self.subtitle_model_combo.currentText()
+        if subtitles_mod.resolve_bundled_model(size):
+            self.subtitle_status_label.setText("\u2713 ready (bundled)")
+            self.subtitle_download_button.setVisible(False)
+        elif is_model_cached(size):
+            self.subtitle_status_label.setText("\u2713 ready")
+            self.subtitle_download_button.setVisible(False)
+        else:
+            size_mb = MODEL_SIZES_MB.get(size, "?")
+            self.subtitle_status_label.setText(
+                f"not downloaded (~{size_mb} MB)"
+            )
+            self.subtitle_download_button.setVisible(True)
+            self.subtitle_download_button.setEnabled(
+                not getattr(self, "_model_downloading", False)
+                and self._busy_owner is None
+            )
+
+    def _download_subtitle_model(self) -> None:
+        if getattr(self, "_model_downloading", False):
+            return
+        if self._busy_owner is not None:
+            QMessageBox.information(
+                self, "Busy",
+                "Wait for the current job to finish before downloading a model."
+            )
+            return
+
+        size = self.subtitle_model_combo.currentText()
+        self._model_downloading = True
+        self.subtitle_download_button.setEnabled(False)
+        self.compile_button.setEnabled(False)
+        self.silence_button.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(True)
+        self.status_label.setStyleSheet("color: #2563EB;")
+        self.status_label.setText(f"Downloading model \"{size}\"...")
+
+        self._model_dl_worker = ModelDownloadWorker(size)
+        self._model_dl_worker.finished_ok.connect(self._on_model_downloaded)
+        self._model_dl_worker.start()
+
+    def _on_model_downloaded(self, ok: bool, message: str) -> None:
+        worker = self.sender()
+        if worker is not None:
+            worker.deleteLater()
+        self._model_dl_worker = None
+        self._model_downloading = False
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.compile_button.setEnabled(True)
+        self.silence_button.setEnabled(True)
+
+        size = self.subtitle_model_combo.currentText()
+        if ok:
+            self.append_log(f"Whisper model \"{size}\" downloaded.")
+        else:
+            self.status_label.setStyleSheet("color: #DC2626;")
+            self.status_label.setText("Model download failed.")
+            self.append_log(
+                f"Model download failed for \"{size}\": {message or 'cancelled'}"
+            )
+        self._restore_status_label()
+        self._refresh_subtitle_model_status()
+
     def _set_subtitle_controls_visible(self, visible: bool) -> None:
         for widget in (
             self.subtitle_model_label,
             self.subtitle_model_combo,
             self.subtitle_lang_label,
             self.subtitle_lang_combo,
+            self.subtitle_status_label,
+            self.subtitle_download_button,
             self.subtitle_hint,
         ):
             widget.setVisible(visible)
+        if visible:
+            self._refresh_subtitle_model_status()
 
     def _set_noise_controls_visible(self, visible: bool) -> None:
         for widget in (

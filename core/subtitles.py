@@ -11,6 +11,7 @@ CPU int8 silently.
 """
 
 import os
+import sys
 
 from pathlib import Path
 
@@ -51,12 +52,87 @@ def is_available() -> bool:
         return False
 
 
+def import_error_detail() -> str | None:
+    """
+    Try importing faster_whisper. Returns ``None`` when it works, otherwise
+    a detailed explanation including the interpreter path and the exact
+    failing module — so "not installed" never misleads again.
+    """
+    try:
+        import faster_whisper  # noqa: F401
+        return None
+    except Exception:
+        import traceback
+
+        tb = traceback.format_exc(limit=3)
+        executable = sys.executable
+        return (
+            f"import failed under \"{executable}\"\n{tb.strip()}\n"
+            f"Fix: \"{executable}\" -m pip install faster-whisper"
+        )
+
+
+def resolve_bundled_model(model_size: str) -> str | None:
+    """Return the bundled model directory for *model_size* if shipped."""
+    relative = os.path.join("assets", "models", f"faster-whisper-{model_size}")
+    search_dirs = [os.getcwd()]
+    if getattr(sys, "frozen", False):
+        search_dirs.insert(0, os.path.dirname(sys.executable))
+    if hasattr(sys, "_MEIPASS"):
+        search_dirs.insert(0, sys._MEIPASS)
+        search_dirs.append(sys._MEIPASS)
+    for base in search_dirs:
+        candidate = os.path.join(base, relative)
+        if os.path.isdir(candidate) and os.listdir(candidate):
+            return candidate
+    return None
+
+
 def _fmt_srt_time(seconds: float) -> str:
     millis = int(round(max(0.0, seconds) * 1000))
     hours, remainder = divmod(millis, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
     secs, millis = divmod(remainder, 1_000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def is_model_cached(model_size: str) -> bool:
+    """True when the HF snapshot already exists locally (or is bundled)."""
+    if resolve_bundled_model(model_size):
+        return True
+    try:
+        from huggingface_hub import snapshot_exists
+        return snapshot_exists(_MODEL_REPO_PREFIX + model_size)
+    except Exception:
+        return False
+
+
+def download_model(
+    model_size: str,
+    progress_cb=None,
+    cancel_check=None,
+) -> bool:
+    """
+    Fetch the HF snapshot for *model_size* into the local cache.
+
+    ``progress_cb(-1)`` signals an indeterminate download; ``1.0`` fires on
+    completion. Returns True when a local snapshot path is available.
+    """
+    repo = _MODEL_REPO_PREFIX + model_size
+    progress_cb = progress_cb or (lambda fraction: None)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(f"huggingface_hub missing: {exc}") from exc
+
+    if cancel_check and cancel_check():
+        return False
+
+    progress_cb(-1)
+    path = snapshot_download(repo_id=repo)
+    progress_cb(1.0)
+    return bool(path)
 
 
 def _load_model(
@@ -74,19 +150,26 @@ def _load_model(
     status_cb = status_cb or (lambda msg: None)
     dl_progress_cb = dl_progress_cb or (lambda fraction: None)
 
+    bundled = resolve_bundled_model(model_size)
+    source = bundled or (_MODEL_REPO_PREFIX + model_size)
+
     status_cb("Checking CUDA libraries...")
     if ensure_cuda_libs(log_cb=log, progress_cb=dl_progress_cb,
                         cancel_check=cancel_check):
         try:
-            model = WhisperModel(model_size, device="cuda", compute_type="float16")
-            log(f"Whisper backend: CUDA float16 (model={model_size})")
+            model = WhisperModel(source, device="cuda", compute_type="float16")
+            origin = "bundled" if bundled else "cache"
+            log(f"Whisper backend: CUDA float16 "
+                f"(model={model_size}, {origin})")
             return model
         except Exception as exc:
             log(f"CUDA load failed ({exc.__class__.__name__}) — using CPU.")
     else:
         log("CUDA unavailable — using CPU.")
 
-    if not _model_cached(model_size):
+    if bundled:
+        status_cb("Loading speech model...")
+    elif not _model_cached(model_size):
         size_mb = MODEL_SIZES_MB.get(model_size)
         msg = (
             f"Downloading Whisper model \"{model_size}\" "
@@ -97,8 +180,10 @@ def _load_model(
         status_cb(msg)
         log(msg)
         progress_cb(-1)  # busy indicator
+    else:
+        status_cb("Loading speech model...")
 
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    model = WhisperModel(source, device="cpu", compute_type="int8")
     log(f"Whisper backend: CPU int8 (model={model_size})")
     return model
 

@@ -1,16 +1,36 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+fw_hiddenimports = (
+    ['faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub']
+    + collect_submodules('faster_whisper')
+)
+fw_datas = (
+    collect_data_files('faster_whisper')
+    + collect_data_files('tokenizers')
+    + collect_data_files('huggingface_hub')
+)
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffmpeg.exe', '.'), ('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffprobe.exe', '.'), ('assets\\models\\mp.rnnn', 'assets/models')],
-    hiddenimports=[],
+    datas=[
+        ('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffmpeg.exe', '.'),
+        ('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffprobe.exe', '.'),
+        ('assets\\models\\mp.rnnn', 'assets/models'),
+        ('assets\\models\\faster-whisper-tiny', 'assets/models/faster-whisper-tiny'),
+    ] + fw_datas,
+    hiddenimports=fw_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'PyQt5', 'PyQt6', 'PySide2', 'shiboken2', 'qtpy',
+        'gmpy2', 'tkinter', 'matplotlib', 'zmq',
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -25,7 +45,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -38,7 +58,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='SmartVideoCompiler',
 )

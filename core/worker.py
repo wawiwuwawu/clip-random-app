@@ -12,6 +12,7 @@ Clip compilation runs in two stages so the user can review the plan:
 """
 
 import os
+import sys
 import tempfile
 import traceback
 from typing import Optional
@@ -671,11 +672,13 @@ class SilenceRemovalWorker(QThread):
         result = {"ok": False, "reason": "", "srt": ""}
 
         if not subtitles_mod.is_available():
+            detail = subtitles_mod.import_error_detail()
             reason = (
-                "faster-whisper is not installed. "
-                "Install with: pip install faster-whisper"
+                "faster-whisper failed to import.\n" + (detail or "")
+                if detail
+                else "faster-whisper is not available in this interpreter."
             )
-            self.log_message.emit("Subtitles skipped — " + reason)
+            self.log_message.emit("Subtitles skipped — see completion dialog.")
             result["reason"] = reason
             self.subtitle_result = result
             return result

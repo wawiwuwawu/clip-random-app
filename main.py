@@ -101,15 +101,15 @@ class Application:
         else:
             worker.encoding_complete.connect(self._on_job_complete)
         worker.error_occurred.connect(self._on_job_error)
-        worker.finished.connect(self._on_worker_finished)
+        # Bind the worker explicitly — Application is not a QObject, so
+        # self.sender() is unavailable inside the slot.
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
         self.window.begin_job(worker.kind)
         worker.start()
 
     # ------------------------------------------------------------------
-    def _on_worker_finished(self) -> None:
-        worker = self.sender()
-        if worker is not None:
-            worker.deleteLater()
+    def _on_worker_finished(self, worker) -> None:
+        worker.deleteLater()
         if self._worker is worker:
             self._worker = None
 

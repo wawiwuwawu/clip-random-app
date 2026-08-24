@@ -21,3 +21,6 @@ ffmpeg-*-full_build/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# HF download metadata inside bundled model
+assets/models/faster-whisper-tiny/.cache/
