@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller
+build/
+dist/
+
+# Inno Setup output
+SmartVideoCompiler_Setup.exe
+
+# FFmpeg bundle (build-time only, referenced by SmartVideoCompiler.spec)
+ffmpeg-*-full_build/
+
+# Machine-local scripts
+*.local.bat
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
