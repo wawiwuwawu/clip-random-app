@@ -49,6 +49,10 @@ Source: "C:\laragon\www\Smart Video Compiler\dist\SmartVideoCompiler\{#MyAppExeN
 Source: "C:\laragon\www\Smart Video Compiler\dist\SmartVideoCompiler\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
+[UninstallDelete]
+; Remove downloaded models / CUDA runtime / history on uninstall
+Type: filesandordirs; Name: "{localappdata}\SmartVideoCompiler"
+
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon

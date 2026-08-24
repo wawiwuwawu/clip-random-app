@@ -44,6 +44,7 @@ from core.ffmpeg_engine import (
     silence_output_name,
 )
 from core import history
+from core.subtitles import SUPPORTED_LANGUAGES
 from ui.clip_preview import ClipPreviewDialog
 from ui.history_dialog import HistoryDialog
 
@@ -501,6 +502,9 @@ class MainWindow(QMainWindow):
     noise_check: QPushButton
     noise_mode_combo: NoWheelComboBox
     noise_strength_combo: NoWheelComboBox
+    subtitle_check: QPushButton
+    subtitle_model_combo: NoWheelComboBox
+    subtitle_lang_combo: NoWheelComboBox
     compile_button: QPushButton
     silence_button: QPushButton
     cancel_button: QPushButton
@@ -512,7 +516,7 @@ class MainWindow(QMainWindow):
     plan_requested = Signal(list, str, int, int, str, bool, bool, float)
     render_requested = Signal(object)
     discard_session_requested = Signal(object)
-    silence_removal_requested = Signal(str, str, str, int, float, float, bool, str, str)
+    silence_removal_requested = Signal(str, str, str, int, float, float, dict, dict)
     cancellation_requested = Signal()
     ffmpeg_override_changed = Signal(str)
 
@@ -877,6 +881,47 @@ class MainWindow(QMainWindow):
         params_layout.addWidget(self.noise_hint)
 
         self._set_noise_controls_visible(False)
+
+        self.subtitle_check = QPushButton("Auto subtitles (.srt)")
+        self.subtitle_check.setObjectName("check-pill")
+        self.subtitle_check.setCheckable(True)
+        self.subtitle_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.subtitle_check.toggled.connect(self._on_subtitle_toggled)
+
+        subtitle_model_label = QLabel("Whisper Model")
+        subtitle_model_label.setObjectName("field-label")
+        subtitle_model_label.setFixedWidth(160)
+        self.subtitle_model_combo = NoWheelComboBox()
+        self.subtitle_model_combo.addItems(["tiny", "base", "small", "medium"])
+        self.subtitle_model_combo.setCurrentIndex(2)
+        self.subtitle_model_combo.setFixedWidth(260)
+        self.subtitle_model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        subtitle_lang_label = QLabel("Language")
+        subtitle_lang_label.setObjectName("field-label")
+        subtitle_lang_label.setFixedWidth(160)
+        self.subtitle_lang_combo = NoWheelComboBox()
+        self.subtitle_lang_combo.addItems(list(SUPPORTED_LANGUAGES.keys()))
+        self.subtitle_lang_combo.setFixedWidth(260)
+        self.subtitle_lang_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.subtitle_model_label = subtitle_model_label
+        self.subtitle_lang_label = subtitle_lang_label
+
+        params_grid.addWidget(self.subtitle_check, 6, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_grid.addWidget(subtitle_model_label, 7, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.subtitle_model_combo, 7, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_grid.addWidget(subtitle_lang_label, 8, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.subtitle_lang_combo, 8, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.subtitle_hint = QLabel(
+            "Transcribes the FINAL file so timings match. First use downloads "
+            "the model once; GPU is used automatically when available."
+        )
+        self.subtitle_hint.setObjectName("hint-label")
+        self.subtitle_hint.setWordWrap(True)
+        params_layout.addWidget(self.subtitle_hint)
+
+        self._set_subtitle_controls_visible(False)
 
         layout.addWidget(params_card)
 
@@ -1486,6 +1531,21 @@ class MainWindow(QMainWindow):
         if not self._loading:
             self._save_settings()
 
+    def _on_subtitle_toggled(self, checked: bool) -> None:
+        self._set_subtitle_controls_visible(checked)
+        if not self._loading:
+            self._save_settings()
+
+    def _set_subtitle_controls_visible(self, visible: bool) -> None:
+        for widget in (
+            self.subtitle_model_label,
+            self.subtitle_model_combo,
+            self.subtitle_lang_label,
+            self.subtitle_lang_combo,
+            self.subtitle_hint,
+        ):
+            widget.setVisible(visible)
+
     def _set_noise_controls_visible(self, visible: bool) -> None:
         for widget in (
             self.noise_mode_label,
@@ -1567,6 +1627,16 @@ class MainWindow(QMainWindow):
         if strength_index >= 0:
             self.noise_strength_combo.setCurrentIndex(strength_index)
 
+        self.subtitle_check.setChecked(settings.value("subtitle_enabled", False, type=bool))
+        sub_model = settings.value("subtitle_model", "small", type=str)
+        sub_model_index = self.subtitle_model_combo.findText(sub_model)
+        if sub_model_index >= 0:
+            self.subtitle_model_combo.setCurrentIndex(sub_model_index)
+        sub_lang = settings.value("subtitle_language", "Auto-detect", type=str)
+        sub_lang_index = self.subtitle_lang_combo.findText(sub_lang)
+        if sub_lang_index >= 0:
+            self.subtitle_lang_combo.setCurrentIndex(sub_lang_index)
+
         last_media = settings.value("last_media_file", "", type=str)
         if last_media and Path(last_media).exists():
             self.silence_file_edit.setText(last_media)
@@ -1591,6 +1661,9 @@ class MainWindow(QMainWindow):
         settings.setValue("noise_enabled", self.noise_check.isChecked())
         settings.setValue("noise_mode", self.noise_mode_combo.currentText())
         settings.setValue("noise_strength", self.noise_strength_combo.currentText())
+        settings.setValue("subtitle_enabled", self.subtitle_check.isChecked())
+        settings.setValue("subtitle_model", self.subtitle_model_combo.currentText())
+        settings.setValue("subtitle_language", self.subtitle_lang_combo.currentText())
         settings.setValue("last_media_file", self.silence_file_edit.text().strip())
         settings.sync()
 
@@ -1856,10 +1929,21 @@ class MainWindow(QMainWindow):
         )
         noise_strength = self.noise_strength_combo.currentText().lower()
 
+        denoise_config = {
+            "enabled": noise_on,
+            "mode": noise_mode,
+            "strength": noise_strength,
+        }
+        subtitle_config = {
+            "enabled": self.subtitle_check.isChecked(),
+            "model": self.subtitle_model_combo.currentText(),
+            "language": self.subtitle_lang_combo.currentText(),
+        }
+
         self.append_log("Starting silence removal...")
         self.silence_removal_requested.emit(
             file_path, output_folder, encoder, threshold_db,
-            min_duration, padding, noise_on, noise_mode, noise_strength,
+            min_duration, padding, denoise_config, subtitle_config,
         )
 
     def _on_cancel_clicked(self) -> None:
@@ -2028,9 +2112,14 @@ class MainWindow(QMainWindow):
         self.end_job()
         self.append_log(f"Finished: {output_path}")
 
+        srt_path = os.path.splitext(output_path)[0] + ".srt"
+        body = f"Saved to:\n{output_path}"
+        if Path(srt_path).is_file():
+            body += f"\n\nSubtitles:\n{srt_path}"
+
         box = QMessageBox(self)
         box.setWindowTitle("Completed")
-        box.setText(f"Saved to:\n{output_path}")
+        box.setText(body)
         open_button = box.addButton("Open Folder", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
         box.exec()

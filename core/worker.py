@@ -18,6 +18,7 @@ from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
+from core import subtitles as subtitles_mod
 from core.clip_plan import ClipEntry, ClipSession
 from core.ffmpeg_engine import (
     FFmpegEngine,
@@ -431,6 +432,7 @@ class SilenceRemovalWorker(QThread):
         min_duration: float = 0.5,
         padding: float = 0.0,
         denoise: Optional[dict] = None,
+        subtitle: Optional[dict] = None,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
@@ -441,6 +443,7 @@ class SilenceRemovalWorker(QThread):
         self.min_duration = min_duration
         self.padding = padding
         self.denoise = denoise or {}
+        self.subtitle = subtitle or {}
 
         self.engine = FFmpegEngine()
         self.engine.log_callback = self.log_message.emit
@@ -521,7 +524,7 @@ class SilenceRemovalWorker(QThread):
         self.log_message.emit(
             f"Found {len(segments)} non-silent segment(s) in \"{filename}\""
         )
-        self.progress_percent.emit(50)
+        self.progress_percent.emit(40)
 
         audio_only = self.engine.is_audio_only(self.video_path)
         self.log_message.emit(f"Input type: {'audio-only' if audio_only else 'video'}")
@@ -574,7 +577,7 @@ class SilenceRemovalWorker(QThread):
                     f"Warning: failed to cut segment {seg_idx + 1}, skipping."
                 )
 
-            progress = 50 + int((seg_idx + 1) / num_segments * 30)
+            progress = 40 + int((seg_idx + 1) / num_segments * 22)
             self.progress_percent.emit(progress)
 
         if not clip_paths:
@@ -587,9 +590,9 @@ class SilenceRemovalWorker(QThread):
             self._emit_cancelled()
             return
 
-        # 4. Concat (80-95 %) --------------------------------------------
+        # 4. Concat (62-70 %) --------------------------------------------
         self.phase_message.emit("Concatenating & encoding...")
-        self.progress_percent.emit(80)
+        self.progress_percent.emit(62)
 
         audio_filters = None
         if self.denoise.get("enabled"):
@@ -646,9 +649,13 @@ class SilenceRemovalWorker(QThread):
             return
 
         self.log_message.emit(f"Saved: \"{os.path.basename(out_path)}\"")
-        self.progress_percent.emit(95)
+        self.progress_percent.emit(70)
 
-        # 5. Cleanup (95-100 %) ------------------------------------------
+        # 5. Subtitles (70-92 %) -----------------------------------------
+        if self.subtitle.get("enabled"):
+            self._generate_subtitles(out_path)
+
+        # 6. Cleanup (92-100 %) ------------------------------------------
         self.phase_message.emit("Cleaning up...")
         self._cleanup_temp_dir()
         self.progress_percent.emit(100)
@@ -656,6 +663,37 @@ class SilenceRemovalWorker(QThread):
         summary = f"Silence removal complete — \"{filename}\" processed."
         self.log_message.emit(summary)
         self.encoding_complete.emit(out_path)
+
+    # ------------------------------------------------------------------
+    def _generate_subtitles(self, output_path: str) -> None:
+        """Transcribe the FINAL output file so SRT timing matches it."""
+        if not subtitles_mod.is_available():
+            self.log_message.emit(
+                "Subtitles skipped — faster-whisper is not installed.\n"
+                "Install with: pip install faster-whisper"
+            )
+            return
+
+        srt_path = os.path.splitext(output_path)[0] + ".srt"
+        try:
+            count, detected = subtitles_mod.transcribe_to_srt(
+                output_path,
+                srt_path,
+                model_size=self.subtitle.get("model", "small"),
+                language=self.subtitle.get("language"),
+                cancel_check=self.isInterruptionRequested,
+                log=self.log_message.emit,
+                status_cb=self.phase_message.emit,
+                progress_cb=lambda frac: self.progress_percent.emit(
+                    70 + int(max(0.0, min(1.0, frac)) * 22)
+                ),
+            )
+            self.log_message.emit(
+                f"Subtitles saved: \"{os.path.basename(srt_path)}\" "
+                f"({count} cue(s), language={detected or '?'})"
+            )
+        except Exception as exc:
+            self.log_message.emit(f"Subtitle generation failed: {exc}")
 
     # ------------------------------------------------------------------
     def _emit_cancelled(self) -> None:
