@@ -1,12 +1,13 @@
-import subprocess
+import json
+import os
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QCheckBox,
+    QDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -15,6 +16,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -26,6 +29,24 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+)
+
+from core.ffmpeg_engine import (
+    AUTO_ENCODER_LABEL,
+    CPU_ENCODER_DISPLAY,
+    FFmpegEngine,
+    GPU_DISPLAY_BY_KEY,
+    compiler_output_name,
+    make_timestamp,
+    silence_output_name,
+)
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma"}
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+MEDIA_FILTER = (
+    "All Media Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.wmv "
+    "*.mp3 *.wav *.aac *.flac *.ogg *.m4a *.wma)"
 )
 
 
@@ -44,7 +65,7 @@ class DropZone(QWidget):
         layout.setSpacing(8)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        title = QLabel("Drag and drop your video file here")
+        title = QLabel("Drag and drop your media file here")
         title.setObjectName("drop-zone-title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -78,10 +99,9 @@ class DropZone(QWidget):
         self.style().unpolish(self)
         self.style().polish(self)
 
-        video_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma"}
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if Path(path).suffix.lower() in video_extensions:
+            if Path(path).suffix.lower() in MEDIA_EXTENSIONS:
                 self.file_dropped.emit(path)
                 break
 
@@ -108,22 +128,354 @@ class FolderDropLineEdit(QLineEdit):
                 break
 
 
+class SourceList(QListWidget):
+    """QListWidget that accepts dragged files and folders."""
+
+    def __init__(self, owner: "SourceListWidget", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._owner = owner
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._owner.add_urls(event.mimeData().urls())
+
+
+class SourceListWidget(QWidget):
+    """Mixed video sources picker: individual files and/or whole folders."""
+
+    sources_changed = Signal()
+
+    KIND_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._known_paths: set[str] = set()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.list_widget = SourceList(self)
+        self.list_widget.setObjectName("source-list")
+        self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.list_widget.setAlternatingRowColors(False)
+        layout.addWidget(self.list_widget)
+
+        buttons_row = QWidget()
+        buttons_layout = QHBoxLayout(buttons_row)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.setSpacing(8)
+
+        self.add_files_button = QPushButton("Add Files...")
+        self.add_files_button.setObjectName("secondary-button")
+        self.add_files_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_files_button.clicked.connect(self._browse_files)
+
+        self.add_folder_button = QPushButton("Add Folder...")
+        self.add_folder_button.setObjectName("secondary-button")
+        self.add_folder_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_folder_button.clicked.connect(self._browse_folder)
+
+        self.remove_button = QPushButton("Remove Selected")
+        self.remove_button.setObjectName("secondary-button")
+        self.remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remove_button.clicked.connect(self._remove_selected)
+
+        self.clear_button = QPushButton("Clear All")
+        self.clear_button.setObjectName("secondary-button")
+        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_button.clicked.connect(self.clear)
+
+        buttons_layout.addWidget(self.add_files_button)
+        buttons_layout.addWidget(self.add_folder_button)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.remove_button)
+        buttons_layout.addWidget(self.clear_button)
+        layout.addWidget(buttons_row)
+
+    # ------------------------------------------------------------------
+    # Adding entries
+    # ------------------------------------------------------------------
+
+    def add_urls(self, urls) -> int:
+        """Add dragged URLs (files and/or folders). Returns count added."""
+        added = 0
+        for url in urls:
+            path = url.toLocalFile()
+            if not path:
+                continue
+            if Path(path).is_dir():
+                added += self._append_entry("dir", path)
+            elif Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+                added += self._append_entry("file", path)
+        if added:
+            self.sources_changed.emit()
+        return added
+
+    def add_paths(self, paths: list[str]) -> int:
+        """Add explicit filesystem paths (files and/or folders)."""
+        added = 0
+        for path in paths:
+            if Path(path).is_dir():
+                added += self._append_entry("dir", path)
+            elif Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+                added += self._append_entry("file", path)
+        if added:
+            self.sources_changed.emit()
+        return added
+
+    def _append_entry(self, kind: str, path: str) -> int:
+        normalized = os.path.abspath(path).lower()
+        if normalized in self._known_paths:
+            return 0
+        self._known_paths.add(normalized)
+
+        item = QListWidgetItem(path)
+        item.setData(self.KIND_ROLE, kind)
+        if kind == "dir":
+            item.setToolTip(f"Folder — every video inside will be scanned.\n{path}")
+            item.setForeground(QColor("#2563EB"))
+        else:
+            item.setToolTip(f"Single video file.\n{path}")
+            item.setForeground(QColor("#111827"))
+        self.list_widget.addItem(item)
+        return 1
+
+    # ------------------------------------------------------------------
+    # Removing entries
+    # ------------------------------------------------------------------
+
+    def _remove_selected(self) -> None:
+        for item in self.list_widget.selectedItems():
+            self._forget(item)
+        self.sources_changed.emit()
+
+    def clear(self) -> None:
+        for item in self._iter_items():
+            self._forget(item)
+        self.sources_changed.emit()
+
+    def _forget(self, item: QListWidgetItem) -> None:
+        self._known_paths.discard(os.path.abspath(item.text()).lower())
+        self.list_widget.takeItem(self.list_widget.row(item))
+
+    # ------------------------------------------------------------------
+    # Accessors
+    # ------------------------------------------------------------------
+
+    def get_sources(self) -> list[tuple[str, str]]:
+        """Return entries as ``(kind, path)`` tuples in insertion order."""
+        return [
+            (item.data(self.KIND_ROLE), item.text())
+            for item in self._iter_items()
+        ]
+
+    def set_sources(self, sources: list[tuple[str, str]]) -> None:
+        self.list_widget.blockSignals(True)
+        self._known_paths.clear()
+        self.list_widget.clear()
+        self.list_widget.blockSignals(False)
+        for kind, path in sources:
+            self._append_entry(kind, path)
+        self.sources_changed.emit()
+
+    def _iter_items(self):
+        return [self.list_widget.item(i) for i in range(self.list_widget.count())]
+
+    # ------------------------------------------------------------------
+    # Browse dialogs
+    # ------------------------------------------------------------------
+
+    def _browse_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Video Files", str(Path.home()), MEDIA_FILTER
+        )
+        if files:
+            self.add_paths(files)
+
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Video Folder", str(Path.home())
+        )
+        if folder:
+            self.add_paths([folder])
+
+
+class GpuDetectWorker(QThread):
+    """Runs hardware encoder detection off the UI thread."""
+
+    detected = Signal(str)
+
+    def run(self) -> None:
+        key = FFmpegEngine().detect_gpu_encoder()
+        self.detected.emit(key)
+
+
+class SettingsDialog(QDialog):
+    """Application settings: FFmpeg location and default output folder."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        ffmpeg_dir: str,
+        default_output: str,
+        version_info: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+
+        grid = QGridLayout()
+        grid.setVerticalSpacing(12)
+        grid.setHorizontalSpacing(10)
+
+        ffmpeg_label = QLabel("FFmpeg Location")
+        ffmpeg_label.setObjectName("field-label")
+        ffmpeg_label.setFixedWidth(150)
+        self.ffmpeg_edit = QLineEdit(ffmpeg_dir)
+        self.ffmpeg_edit.setReadOnly(True)
+        self.ffmpeg_edit.setPlaceholderText(
+            "Automatic — bundled binary or system PATH"
+        )
+        ffmpeg_browse = QPushButton("Browse...")
+        ffmpeg_browse.setObjectName("secondary-button")
+        ffmpeg_browse.setFixedWidth(90)
+        ffmpeg_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        ffmpeg_browse.clicked.connect(self._browse_ffmpeg_dir)
+        ffmpeg_clear = QPushButton("Reset")
+        ffmpeg_clear.setObjectName("secondary-button")
+        ffmpeg_clear.setFixedWidth(70)
+        ffmpeg_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        ffmpeg_clear.clicked.connect(lambda: self.ffmpeg_edit.clear())
+
+        output_label = QLabel("Default Output")
+        output_label.setObjectName("field-label")
+        output_label.setFixedWidth(150)
+        self.output_edit = QLineEdit(default_output)
+        self.output_edit.setReadOnly(True)
+        self.output_edit.setPlaceholderText("No default output folder set")
+        output_browse = QPushButton("Browse...")
+        output_browse.setObjectName("secondary-button")
+        output_browse.setFixedWidth(90)
+        output_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        output_browse.clicked.connect(self._browse_default_output)
+        output_clear = QPushButton("Reset")
+        output_clear.setObjectName("secondary-button")
+        output_clear.setFixedWidth(70)
+        output_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        output_clear.clicked.connect(lambda: self.output_edit.clear())
+
+        grid.addWidget(ffmpeg_label, 0, 0)
+        grid.addWidget(self.ffmpeg_edit, 0, 1)
+        grid.addWidget(ffmpeg_browse, 0, 2)
+        grid.addWidget(ffmpeg_clear, 0, 3)
+        grid.addWidget(output_label, 1, 0)
+        grid.addWidget(self.output_edit, 1, 1)
+        grid.addWidget(output_browse, 1, 2)
+        grid.addWidget(output_clear, 1, 3)
+        layout.addLayout(grid)
+
+        info = QLabel(
+            f"Active FFmpeg:\n{version_info}\n\n"
+            "Override only needed when the bundled/system FFmpeg lacks GPU encoders."
+        )
+        info.setObjectName("hint-label")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        layout.addStretch()
+
+        buttons_row = QWidget()
+        buttons_layout = QHBoxLayout(buttons_row)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.reset_all_button = QPushButton("Reset All Settings")
+        self.reset_all_button.setObjectName("danger-button")
+        self.reset_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reset_all_button.clicked.connect(self._reset_all_settings)
+
+        close_button = QPushButton("Cancel")
+        close_button.setObjectName("secondary-button")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.clicked.connect(self.reject)
+
+        save_button = QPushButton("Save")
+        save_button.setObjectName("primary-button")
+        save_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_button.clicked.connect(self.accept)
+
+        buttons_layout.addWidget(self.reset_all_button)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(close_button)
+        buttons_layout.addWidget(save_button)
+        layout.addWidget(buttons_row)
+
+    # ------------------------------------------------------------------
+    def _browse_ffmpeg_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder Containing ffmpeg.exe / ffprobe.exe",
+            self.ffmpeg_edit.text() or str(Path.home()),
+        )
+        if folder:
+            self.ffmpeg_edit.setText(folder)
+
+    def _browse_default_output(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Default Output Folder",
+            self.output_edit.text() or str(Path.home()),
+        )
+        if folder:
+            self.output_edit.setText(folder)
+
+    def _reset_all_settings(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Reset Settings",
+            "All saved settings will be cleared.\n"
+            "The application will use defaults after restart.\n\nContinue?",
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            QSettings("SmartVideoCompiler", "MainWindow").clear()
+            self.parent()._settings_reset_requested = True
+            self.reject()
+
+    def ffmpeg_dir_value(self) -> str:
+        return self.ffmpeg_edit.text().strip()
+
+    def default_output_value(self) -> str:
+        return self.output_edit.text().strip()
+
+
 class MainWindow(QMainWindow):
     """Primary application window for the Smart Video Compiler desktop UI."""
 
     # Public widget references for external access
     compile_pill: QPushButton
     silence_pill: QPushButton
-    compiler_content: QWidget
-    silence_content: QWidget
-    input_folder_edit: QLineEdit
-    output_folder_edit: QLineEdit
+    content_stack: QStackedWidget
+    source_list: SourceListWidget
+    output_folder_edit: FolderDropLineEdit
     total_duration_spin: QSpinBox
     clip_duration_spin: QSpinBox
     encoder_combo: QComboBox
-    silence_encoder_combo: QComboBox
-    silence_file_edit: QLineEdit
+    detected_label: QLabel
+    preview_label: QLabel
     silence_drop_zone: DropZone
+    silence_file_edit: QLineEdit
     threshold_spin: QSpinBox
     min_duration_spin: QDoubleSpinBox
     padding_spin: QDoubleSpinBox
@@ -135,31 +487,10 @@ class MainWindow(QMainWindow):
     log_console: QPlainTextEdit
 
     # Public signals
-    compilation_requested = Signal(str, str, int, int, str)
+    compilation_requested = Signal(list, str, int, int, str)
     silence_removal_requested = Signal(str, str, str, int, float, float)
     cancellation_requested = Signal()
-
-    @staticmethod
-    def _detect_gpu_encoder_display() -> str:
-        """Run ffmpeg -encoders to detect available GPU, return display name."""
-        key_to_display = {
-            "nvenc": "NVIDIA NVENC (h264_nvenc)",
-            "qsv": "Intel QSV (h264_qsv)",
-            "amf": "AMD AMF (h264_amf)",
-            "cpu": "CPU Software (libx264)",
-        }
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
-                capture_output=True, text=True, timeout=5,
-            )
-            output = result.stdout.lower() + result.stderr.lower()
-            for key in ("nvenc", "qsv", "amf"):
-                if f"h264_{key}" in output:
-                    return key_to_display[key]
-        except Exception:
-            pass
-        return key_to_display["cpu"]
+    ffmpeg_override_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -168,13 +499,25 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(780, 550)
         self.resize(960, 700)
 
+        self._processing = False
+        self._detected_key: str | None = None
+        self._detect_worker: GpuDetectWorker | None = None
+        self._settings_reset_requested = False
+        self._loading = False
+
         self._build_ui()
         self._apply_stylesheet()
-        self._load_output_folder()
+        self._connect_dynamic_updates()
+        self._load_settings()
+        self._update_output_preview()
+        self._restore_status_label()
+
+        QTimer.singleShot(250, self.start_detection)
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
+
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
@@ -197,7 +540,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 0, 24, 0)
         layout.setSpacing(0)
 
-        # App icon + title
         brand = QWidget()
         brand_layout = QHBoxLayout(brand)
         brand_layout.setContentsMargins(0, 0, 0, 0)
@@ -216,7 +558,6 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(48)
 
-        # Mode switcher pills
         self.compile_pill = QPushButton("Clip Compiler")
         self.compile_pill.setObjectName("mode-pill")
         self.compile_pill.setCheckable(True)
@@ -241,20 +582,21 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Settings + help placeholders
-        settings_button = QPushButton("⚙")
-        settings_button.setObjectName("icon-button")
-        settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        settings_button.setToolTip("Settings")
+        self.settings_button = QPushButton("\u2699")
+        self.settings_button.setObjectName("icon-button")
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setToolTip("Settings")
+        self.settings_button.clicked.connect(self._open_settings)
 
-        help_button = QPushButton("?")
-        help_button.setObjectName("icon-button")
-        help_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        help_button.setToolTip("Help")
+        self.help_button = QPushButton("?")
+        self.help_button.setObjectName("icon-button")
+        self.help_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.help_button.setToolTip("Help")
+        self.help_button.clicked.connect(self._open_help)
 
-        layout.addWidget(settings_button)
+        layout.addWidget(self.settings_button)
         layout.addSpacing(12)
-        layout.addWidget(help_button)
+        layout.addWidget(self.help_button)
 
         return header
 
@@ -271,108 +613,36 @@ class MainWindow(QMainWindow):
         scroll_layout.setContentsMargins(32, 28, 32, 16)
         scroll_layout.setSpacing(18)
 
-        # Mode-specific content
         self.content_stack = QStackedWidget()
-        self.compiler_content = self._create_compiler_content()
-        self.silence_content = self._create_silence_content()
-        self.content_stack.addWidget(self.compiler_content)
-        self.content_stack.addWidget(self.silence_content)
+        self.content_stack.addWidget(self._create_compiler_page())
+        self.content_stack.addWidget(self._create_silence_page())
         scroll_layout.addWidget(self.content_stack)
 
-        # Progress Logs card
-        progress_card = self._create_progress_log_card()
-        scroll_layout.addWidget(progress_card)
-
-        # Footer
-        footer = self._create_footer()
-        scroll_layout.addWidget(footer)
+        scroll_layout.addWidget(self._create_shared_output_card())
+        scroll_layout.addWidget(self._create_progress_log_card())
+        scroll_layout.addWidget(self._create_footer())
 
         scroll.setWidget(scroll_content)
         return scroll
 
-    def _create_card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
-        card = QFrame()
-        card.setObjectName("card")
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
-
-        title_label = QLabel(title)
-        title_label.setObjectName("card-title")
-        layout.addWidget(title_label)
-
-        return card, layout
-
-    def _create_mode_title(self, title: str, subtitle: str) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        title_label = QLabel(title)
-        title_label.setObjectName("mode-title")
-        layout.addWidget(title_label)
-
-        subtitle_label = QLabel(subtitle)
-        subtitle_label.setObjectName("mode-subtitle")
-        layout.addWidget(subtitle_label)
-
-        return widget
-
-    def _create_compiler_content(self) -> QWidget:
+    def _create_compiler_page(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        # Page title
         title = self._create_mode_title(
             "Clip Compiler",
-            "Remove silence and compile the best clips into one video.",
+            "Pick random highlights from your videos and compile them into one.",
         )
         layout.addWidget(title)
 
-        # Input & Output card
-        io_card, io_layout = self._create_card("Input & Output")
-        io_grid = QGridLayout()
-        io_grid.setVerticalSpacing(14)
-        io_grid.setHorizontalSpacing(8)
+        sources_card, sources_layout = self._create_card("Source Videos")
+        self.source_list = SourceListWidget()
+        self.source_list.sources_changed.connect(self._on_sources_changed)
+        sources_layout.addWidget(self.source_list)
+        layout.addWidget(sources_card)
 
-        input_label = QLabel("Input Folder")
-        input_label.setObjectName("field-label")
-        input_label.setFixedWidth(110)
-        self.input_folder_edit = FolderDropLineEdit(on_folder_dropped=self._on_input_folder_dropped)
-        self.input_folder_edit.setReadOnly(True)
-        self.input_folder_edit.setPlaceholderText("Select a folder containing source videos...")
-        input_browse = QPushButton("Browse...")
-        input_browse.setObjectName("secondary-button")
-        input_browse.setFixedWidth(90)
-        input_browse.setCursor(Qt.CursorShape.PointingHandCursor)
-        input_browse.clicked.connect(self._browse_input_folder)
-
-        output_label = QLabel("Output Folder")
-        output_label.setObjectName("field-label")
-        output_label.setFixedWidth(110)
-        self.output_folder_edit = QLineEdit()
-        self.output_folder_edit.setReadOnly(True)
-        self.output_folder_edit.setPlaceholderText("Choose where the final video will be saved...")
-        output_browse = QPushButton("Browse...")
-        output_browse.setObjectName("secondary-button")
-        output_browse.setFixedWidth(90)
-        output_browse.setCursor(Qt.CursorShape.PointingHandCursor)
-        output_browse.clicked.connect(self._browse_output_folder)
-
-        io_grid.addWidget(input_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        io_grid.addWidget(self.input_folder_edit, 0, 1)
-        io_grid.addWidget(input_browse, 0, 2)
-        io_grid.addWidget(output_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        io_grid.addWidget(self.output_folder_edit, 1, 1)
-        io_grid.addWidget(output_browse, 1, 2)
-        io_layout.addLayout(io_grid)
-        layout.addWidget(io_card)
-
-        # Compilation Settings card
         settings_card, settings_layout = self._create_card("Compilation Settings")
         settings_grid = QGridLayout()
         settings_grid.setVerticalSpacing(12)
@@ -396,64 +666,35 @@ class MainWindow(QMainWindow):
         self.clip_duration_spin.setValue(10)
         self.clip_duration_spin.setFixedWidth(90)
 
-        encoder_label = QLabel("Hardware Encoder")
-        encoder_label.setObjectName("field-label")
-        encoder_label.setFixedWidth(160)
-        self.encoder_combo = QComboBox()
-        self.encoder_combo.addItems(
-            [
-                "NVIDIA NVENC (h264_nvenc)",
-                "Intel QSV (h264_qsv)",
-                "AMD AMF (h264_amf)",
-                "CPU Software (libx264)",
-            ]
-        )
-        self.encoder_combo.insertItem(0, "Auto (Detect)")
-        self.encoder_combo.setCurrentIndex(0)
-        self.encoder_combo.setFixedWidth(260)
-        self.encoder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
         settings_grid.addWidget(total_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.total_duration_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(clip_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.clip_duration_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        settings_grid.addWidget(encoder_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        settings_grid.addWidget(self.encoder_combo, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_layout.addLayout(settings_grid)
         layout.addWidget(settings_card)
 
-        # Action button
         self.compile_button = QPushButton("Start Compilation")
         self.compile_button.setMinimumHeight(44)
         self.compile_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.compile_button.clicked.connect(self._on_compile_clicked)
-        self.compile_button.setStyleSheet(
-            "QPushButton { background-color: #2563EB; color: #FFFFFF;"
-            " border: none; border-radius: 8px; font-size: 14px; font-weight: 600;"
-            " padding: 10px 24px; }"
-            "QPushButton:hover { background-color: #1D4ED8; }"
-            "QPushButton:pressed { background-color: #1E40AF; }"
-            "QPushButton:disabled { background-color: #93C5FD; color: #FFFFFF; }"
-        )
+        self.compile_button.setStyleSheet(self._primary_button_qss())
         layout.addWidget(self.compile_button)
 
         return widget
 
-    def _create_silence_content(self) -> QWidget:
+    def _create_silence_page(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        # Page title
         title = self._create_mode_title(
             "Silence Removal",
-            "Remove silent parts from a single video and save the trimmed result.",
+            "Remove silent parts from a single media file and save the trimmed result.",
         )
         layout.addWidget(title)
 
-        # Select Source Video card
-        source_card, source_layout = self._create_card("Select Source Video")
+        source_card, source_layout = self._create_card("Select Source Media")
 
         self.silence_drop_zone = DropZone()
         self.silence_drop_zone.file_dropped.connect(self._on_silence_file_dropped)
@@ -470,7 +711,7 @@ class MainWindow(QMainWindow):
         file_label.setFixedWidth(90)
         self.silence_file_edit = QLineEdit()
         self.silence_file_edit.setReadOnly(True)
-        self.silence_file_edit.setPlaceholderText("No video file selected...")
+        self.silence_file_edit.setPlaceholderText("No media file selected...")
         file_browse = QPushButton("Browse...")
         file_browse.setObjectName("secondary-button")
         file_browse.setFixedWidth(90)
@@ -484,7 +725,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(source_card)
 
-        # Silence Detection Parameters card
         params_card, params_layout = self._create_card("Silence Detection Parameters")
         params_grid = QGridLayout()
         params_grid.setVerticalSpacing(12)
@@ -521,11 +761,54 @@ class MainWindow(QMainWindow):
         self.padding_spin.setDecimals(1)
         self.padding_spin.setFixedWidth(90)
 
+        params_grid.addWidget(threshold_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.threshold_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_grid.addWidget(min_dur_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.min_duration_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_grid.addWidget(padding_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.padding_spin, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_layout.addLayout(params_grid)
+
+        layout.addWidget(params_card)
+
+        self.silence_button = QPushButton("Remove Silence & Save")
+        self.silence_button.setMinimumHeight(44)
+        self.silence_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.silence_button.clicked.connect(self._on_silence_clicked)
+        self.silence_button.setStyleSheet(self._primary_button_qss())
+        layout.addWidget(self.silence_button)
+
+        return widget
+
+    def _create_shared_output_card(self) -> QFrame:
+        card, layout = self._create_card("Output & Encoder")
+
+        grid = QGridLayout()
+        grid.setVerticalSpacing(12)
+        grid.setHorizontalSpacing(10)
+
+        output_label = QLabel("Output Folder")
+        output_label.setObjectName("field-label")
+        output_label.setFixedWidth(160)
+        self.output_folder_edit = FolderDropLineEdit(
+            on_folder_dropped=lambda p: self.append_log(f"Output folder set to: {p}")
+        )
+        self.output_folder_edit.setReadOnly(True)
+        self.output_folder_edit.setPlaceholderText(
+            "Where compiled / cleaned results will be saved..."
+        )
+        output_browse = QPushButton("Browse...")
+        output_browse.setObjectName("secondary-button")
+        output_browse.setFixedWidth(90)
+        output_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        output_browse.clicked.connect(self._browse_output_folder)
+
         encoder_label = QLabel("Hardware Encoder")
         encoder_label.setObjectName("field-label")
         encoder_label.setFixedWidth(160)
-        self.silence_encoder_combo = QComboBox()
-        self.silence_encoder_combo.addItems(
+        self.encoder_combo = QComboBox()
+        self.encoder_combo.addItem(AUTO_ENCODER_LABEL)
+        self.encoder_combo.addItems(
             [
                 "NVIDIA NVENC (h264_nvenc)",
                 "Intel QSV (h264_qsv)",
@@ -533,44 +816,32 @@ class MainWindow(QMainWindow):
                 "CPU Software (libx264)",
             ]
         )
-        self.silence_encoder_combo.insertItem(0, "Auto (Detect)")
-        self.silence_encoder_combo.setCurrentIndex(0)
-        self.silence_encoder_combo.setFixedWidth(260)
-        self.silence_encoder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.encoder_combo.setCurrentIndex(0)
+        self.encoder_combo.setFixedWidth(260)
+        self.encoder_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        params_grid.addWidget(threshold_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        params_grid.addWidget(self.threshold_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        params_grid.addWidget(min_dur_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        params_grid.addWidget(self.min_duration_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        params_grid.addWidget(padding_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        params_grid.addWidget(self.padding_spin, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        params_grid.addWidget(encoder_label, 3, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        params_grid.addWidget(self.silence_encoder_combo, 3, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        params_layout.addLayout(params_grid)
+        grid.addWidget(output_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.output_folder_edit, 0, 1)
+        grid.addWidget(output_browse, 0, 2)
+        grid.addWidget(encoder_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.encoder_combo, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addLayout(grid)
 
-        layout.addWidget(params_card)
+        self.detected_label = QLabel("Detecting GPU encoder...")
+        self.detected_label.setObjectName("hint-label")
+        layout.addWidget(self.detected_label)
 
-        # Action button
-        self.silence_button = QPushButton("Remove Silence & Save")
-        self.silence_button.setMinimumHeight(44)
-        self.silence_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.silence_button.clicked.connect(self._on_silence_clicked)
-        self.silence_button.setStyleSheet(
-            "QPushButton { background-color: #2563EB; color: #FFFFFF;"
-            " border: none; border-radius: 8px; font-size: 14px; font-weight: 600;"
-            " padding: 10px 24px; }"
-            "QPushButton:hover { background-color: #1D4ED8; }"
-            "QPushButton:pressed { background-color: #1E40AF; }"
-            "QPushButton:disabled { background-color: #93C5FD; color: #FFFFFF; }"
-        )
-        layout.addWidget(self.silence_button)
+        self.preview_label = QLabel("")
+        self.preview_label.setObjectName("hint-label")
+        self.preview_label.setWordWrap(True)
+        layout.addWidget(self.preview_label)
 
-        return widget
+        return card
 
     def _create_progress_log_card(self) -> QFrame:
         card, layout = self._create_card("Progress Logs")
 
-        self.status_label = QLabel("Ready — Waiting for input folder...")
+        self.status_label = QLabel("Ready — Waiting for input...")
         self.status_label.setObjectName("status-label")
         layout.addWidget(self.status_label)
 
@@ -601,9 +872,8 @@ class MainWindow(QMainWindow):
         self.log_console.setReadOnly(True)
         self.log_console.setPlaceholderText("Activity logs will appear here...")
         self.log_console.setObjectName("log-console")
-        # Direct stylesheet overrides palette — guaranteed to work
         self.log_console.setStyleSheet(
-            "QPlainTextEdit { background-color: #F5F5F5; color: #111827;"
+            "QPlainTextEdit { background-color: #2D2D2D; color: #D1D5DB;"
             " font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 13px;"
             " border: 1px solid #E5E5E5; border-radius: 6px; padding: 12px; }"
         )
@@ -617,7 +887,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        copyright = QLabel("© 2024 Smart Video Compiler — Desktop Pro Edition")
+        copyright = QLabel("\u00a9 2026 Smart Video Compiler \u2014 Desktop Pro Edition")
         copyright.setObjectName("footer-label")
 
         links = QLabel("Documentation    Support    Release Notes")
@@ -629,9 +899,51 @@ class MainWindow(QMainWindow):
 
         return widget
 
+    def _create_card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
+        card = QFrame()
+        card.setObjectName("card")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("card-title")
+        layout.addWidget(title_label)
+
+        return card, layout
+
+    def _create_mode_title(self, title: str, subtitle: str) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("mode-title")
+        layout.addWidget(title_label)
+
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("mode-subtitle")
+        layout.addWidget(subtitle_label)
+
+        return widget
+
+    @staticmethod
+    def _primary_button_qss() -> str:
+        return (
+            "QPushButton { background-color: #2563EB; color: #FFFFFF;"
+            " border: none; border-radius: 8px; font-size: 14px; font-weight: 600;"
+            " padding: 10px 24px; }"
+            "QPushButton:hover { background-color: #1D4ED8; }"
+            "QPushButton:pressed { background-color: #1E40AF; }"
+            "QPushButton:disabled { background-color: #93C5FD; color: #FFFFFF; }"
+        )
+
     # ------------------------------------------------------------------
     # Stylesheet
     # ------------------------------------------------------------------
+
     def _apply_stylesheet(self) -> None:
         self.setStyleSheet(
             """
@@ -741,6 +1053,12 @@ class MainWindow(QMainWindow):
                 line-height: 16px;
             }
 
+            #hint-label {
+                font-size: 11px;
+                color: #6B7280;
+                line-height: 15px;
+            }
+
             QLineEdit,
             QSpinBox,
             QDoubleSpinBox,
@@ -793,27 +1111,27 @@ class MainWindow(QMainWindow):
                 padding: 4px;
             }
 
-            QCheckBox {
-                spacing: 8px;
-                color: #4B5563;
-                font-size: 12px;
-            }
-
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border-radius: 4px;
-                border: 1px solid #D1D5DB;
+            #source-list {
                 background-color: #FFFFFF;
+                border: 1px dashed #C2C6D4;
+                border-radius: 8px;
+                padding: 6px;
+                font-size: 13px;
+                min-height: 120px;
             }
 
-            QCheckBox::indicator:checked {
-                background-color: #2563EB;
-                border: 1px solid #2563EB;
+            #source-list::item {
+                padding: 6px 8px;
+                border-radius: 4px;
             }
 
-            QCheckBox::indicator:hover {
-                border: 1px solid #93C5FD;
+            #source-list::item:selected {
+                background-color: #EFF6FF;
+                color: #1D4ED8;
+            }
+
+            #source-list::item:hover:!selected {
+                background-color: #F3F4F6;
             }
 
             QPushButton#primary-button {
@@ -858,6 +1176,21 @@ class MainWindow(QMainWindow):
 
             QPushButton#secondary-button:pressed {
                 background-color: #F3F4F6;
+            }
+
+            QPushButton#danger-button {
+                background-color: #FFFFFF;
+                border: 1px solid #BA1A1A;
+                color: #BA1A1A;
+                border-radius: 6px;
+                padding: 8px 14px;
+                font-weight: 500;
+                font-size: 12px;
+                min-height: 34px;
+            }
+
+            QPushButton#danger-button:hover {
+                background-color: #FFDAD6;
             }
 
             QPushButton#cancel-button {
@@ -941,34 +1274,6 @@ class MainWindow(QMainWindow):
                 border-radius: 9999px;
             }
 
-            #log-console {
-                background-color: #2D2D2D;
-                color: #D1D5DB;
-                border: none;
-                border-radius: 6px;
-                padding: 12px;
-                font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
-                font-size: 13px;
-                line-height: 1.5;
-                selection-background-color: #4B5563;
-            }
-
-            #log-console QScrollBar:vertical {
-                background-color: #3D3D3D;
-                width: 12px;
-                border-radius: 6px;
-            }
-
-            #log-console QScrollBar::handle:vertical {
-                background-color: #6B7280;
-                border-radius: 6px;
-                min-height: 28px;
-            }
-
-            #log-console QScrollBar::handle:vertical:hover {
-                background-color: #9CA3AF;
-            }
-
             #footer-label {
                 font-size: 11px;
                 color: #9CA3AF;
@@ -984,37 +1289,220 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------
-    # Settings persistence
+    # Dynamic wiring
     # ------------------------------------------------------------------
-    def _load_output_folder(self) -> None:
-        settings = QSettings("SmartVideoCompiler", "MainWindow")
-        saved_output = settings.value("output_folder", "")
-        if saved_output and Path(saved_output).exists():
-            self.output_folder_edit.setText(saved_output)
+
+    def _connect_dynamic_updates(self) -> None:
+        self.total_duration_spin.valueChanged.connect(lambda _: self._save_settings())
+        self.clip_duration_spin.valueChanged.connect(lambda _: self._save_settings())
+        self.encoder_combo.currentTextChanged.connect(lambda _: self._save_settings())
+        self.threshold_spin.valueChanged.connect(lambda _: self._save_settings())
+        self.min_duration_spin.valueChanged.connect(lambda _: self._save_settings())
+        self.padding_spin.valueChanged.connect(lambda _: self._save_settings())
+
+        self.output_folder_edit.textChanged.connect(lambda _: self._on_output_changed())
+        self.silence_file_edit.textChanged.connect(lambda _: self._on_silence_file_text_changed())
 
     # ------------------------------------------------------------------
-    # Internal behavior
+    # Settings persistence
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings("SmartVideoCompiler", "MainWindow")
+
+    def _load_settings(self) -> None:
+        self._loading = True
+        try:
+            self._load_settings_impl()
+        finally:
+            self._loading = False
+
+    def _load_settings_impl(self) -> None:
+        settings = self._settings()
+
+        output = settings.value("output_folder", "", type=str)
+        if output and Path(output).exists():
+            self.output_folder_edit.setText(output)
+        else:
+            default_output = settings.value("default_output_folder", "", type=str)
+            if default_output and Path(default_output).exists():
+                self.output_folder_edit.setText(default_output)
+
+        raw_sources = settings.value("sources", "", type=str)
+        pairs: list[tuple[str, str]] = []
+        if raw_sources:
+            try:
+                data = json.loads(raw_sources)
+                pairs = [
+                    (entry["kind"], entry["path"])
+                    for entry in data
+                    if entry.get("kind") in ("file", "dir") and entry.get("path")
+                ]
+            except (ValueError, TypeError, KeyError):
+                pairs = []
+        if pairs:
+            self.source_list.set_sources(pairs)
+
+        self.total_duration_spin.setValue(int(settings.value("total_duration", 5)))
+        self.clip_duration_spin.setValue(int(settings.value("clip_duration", 10)))
+
+        encoder_choice = settings.value("encoder_choice", "", type=str)
+        index = self.encoder_combo.findText(encoder_choice)
+        if index >= 0:
+            self.encoder_combo.setCurrentIndex(index)
+
+        self.threshold_spin.setValue(int(settings.value("threshold_db", -30)))
+        self.min_duration_spin.setValue(float(settings.value("min_duration", 0.5)))
+        self.padding_spin.setValue(float(settings.value("padding", 0.0)))
+
+        last_media = settings.value("last_media_file", "", type=str)
+        if last_media and Path(last_media).exists():
+            self.silence_file_edit.setText(last_media)
+
+    def _save_settings(self) -> None:
+        settings = self._settings()
+        sources = self.source_list.get_sources()
+        settings.setValue(
+            "sources",
+            json.dumps(
+                [{"kind": kind, "path": path} for kind, path in sources]
+            ),
+        )
+        settings.setValue("output_folder", self.output_folder_edit.text().strip())
+        settings.setValue("total_duration", self.total_duration_spin.value())
+        settings.setValue("clip_duration", self.clip_duration_spin.value())
+        settings.setValue("encoder_choice", self.encoder_combo.currentText())
+        settings.setValue("threshold_db", self.threshold_spin.value())
+        settings.setValue("min_duration", self.min_duration_spin.value())
+        settings.setValue("padding", self.padding_spin.value())
+        settings.setValue("last_media_file", self.silence_file_edit.text().strip())
+        settings.sync()
+
+    def _on_output_changed(self) -> None:
+        if self._loading:
+            return
+        self._save_settings()
+        self._update_output_preview()
+
+    def _on_silence_file_text_changed(self) -> None:
+        if self._loading:
+            return
+        self._save_settings()
+        self._update_output_preview()
+
+    def _on_sources_changed(self) -> None:
+        if self._loading:
+            return
+        self._save_settings()
+        self._update_output_preview()
+
+    # ------------------------------------------------------------------
+    # GPU detection
+    # ------------------------------------------------------------------
+
+    def start_detection(self) -> None:
+        """Start background hardware encoder detection (safe to re-call)."""
+        if self._detect_worker is not None:
+            return
+        self.detected_label.setText("Detecting GPU encoder...")
+        self._detect_worker = GpuDetectWorker()
+        self._detect_worker.detected.connect(self._on_gpu_detected)
+        self._detect_worker.start()
+
+    def _on_gpu_detected(self, key: str) -> None:
+        self._detected_key = key
+        self._detect_worker = None
+        self._update_detected_label()
+        if key == "cpu":
+            self.append_log("Startup detection: no usable GPU encoder found.")
+        else:
+            self.append_log(f"Startup detection: {GPU_DISPLAY_BY_KEY[key]} available.")
+
+    def _update_detected_label(self) -> None:
+        if self._detected_key is None:
+            self.detected_label.setText("Detecting GPU encoder...")
+        elif self._detected_key == "cpu":
+            self.detected_label.setText(
+                "No GPU encoder detected \u2014 CPU encoding will be used."
+            )
+        else:
+            self.detected_label.setText(
+                f"GPU detected: {GPU_DISPLAY_BY_KEY[self._detected_key]}"
+            )
+
+    def _effective_encoder_display(self) -> str:
+        choice = self.encoder_combo.currentText()
+        if choice != AUTO_ENCODER_LABEL:
+            return choice
+
+        if self._detected_key is None:
+            self._detected_key = FFmpegEngine().detect_gpu_encoder()
+            self._update_detected_label()
+
+        if self._detected_key == "cpu":
+            display = CPU_ENCODER_DISPLAY
+        else:
+            display = GPU_DISPLAY_BY_KEY[self._detected_key]
+        self.append_log(f"Auto-detected encoder: {display}")
+        return display
+
+    # ------------------------------------------------------------------
+    # Output preview
+    # ------------------------------------------------------------------
+
+    def _update_output_preview(self) -> None:
+        output_folder = self.output_folder_edit.text().strip()
+        if not output_folder:
+            self.preview_label.setText(
+                "Select an output folder to preview the result path."
+            )
+            return
+
+        stamp = make_timestamp()
+        if self.content_stack.currentIndex() == 0:
+            name = f"{compiler_output_name(stamp)}.mp4"
+            self.preview_label.setText(f"Output: {os.path.join(output_folder, name)}")
+            return
+
+        media_path = self.silence_file_edit.text().strip()
+        if not media_path:
+            self.preview_label.setText(
+                "Select a media file to preview the result path."
+            )
+            return
+
+        stem = Path(media_path).stem
+        extension = ".m4a" if Path(media_path).suffix.lower() in AUDIO_EXTENSIONS else ".mp4"
+        name = silence_output_name(stem, extension, stamp)
+        self.preview_label.setText(f"Output: {os.path.join(output_folder, name)}")
+
+    # ------------------------------------------------------------------
+    # Mode switching
+    # ------------------------------------------------------------------
+
     def _show_compiler_mode(self) -> None:
         self.content_stack.setCurrentIndex(0)
-        self.status_label.setText("Ready — Waiting for input folder...")
+        self._restore_status_label()
+        self._update_output_preview()
 
     def _show_silence_mode(self) -> None:
         self.content_stack.setCurrentIndex(1)
-        self.status_label.setText("Ready — Waiting for video file...")
+        self._restore_status_label()
+        self._update_output_preview()
 
-    def _browse_input_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Input Folder",
-            self.input_folder_edit.text() or str(Path.home()),
-        )
-        if folder:
-            self.input_folder_edit.setText(folder)
-            self.append_log(f"Input folder set to: {folder}")
+    def _restore_status_label(self) -> None:
+        if self._processing:
+            return
+        self.status_label.setStyleSheet("color: #22C55E;")
+        if self.content_stack.currentIndex() == 0:
+            self.status_label.setText("Ready \u2014 Add video sources to begin.")
+        else:
+            self.status_label.setText("Ready \u2014 Waiting for media file.")
 
-    def _on_input_folder_dropped(self, folder: str) -> None:
-        self.append_log(f"Input folder set to: {folder}")
+    # ------------------------------------------------------------------
+    # Browsing
+    # ------------------------------------------------------------------
 
     def _browse_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -1024,15 +1512,14 @@ class MainWindow(QMainWindow):
         )
         if folder:
             self.output_folder_edit.setText(folder)
-            QSettings("SmartVideoCompiler", "MainWindow").setValue("output_folder", folder)
             self.append_log(f"Output folder set to: {folder}")
 
     def _browse_silence_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Video File",
-            str(Path.home()),
-            "All Media Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.wmv *.mp3 *.wav *.aac *.flac *.ogg *.m4a *.wma)",
+            "Select Media File",
+            str(Path.home()) if not self.silence_file_edit.text() else self.silence_file_edit.text(),
+            MEDIA_FILTER,
         )
         if file_path:
             self.silence_file_edit.setText(file_path)
@@ -1042,30 +1529,123 @@ class MainWindow(QMainWindow):
         self.silence_file_edit.setText(file_path)
         self.append_log(f"Silence removal file dropped: {file_path}")
 
-    def _validate_folders(self) -> tuple[str, str] | None:
-        """Return (input_folder, output_folder) if both are valid, otherwise None."""
-        input_folder = self.input_folder_edit.text().strip()
-        output_folder = self.output_folder_edit.text().strip()
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
-        if not input_folder:
-            QMessageBox.warning(self, "Missing Input Folder", "Please select an input folder.")
+    def _validated_output_folder(self) -> str | None:
+        folder = self.output_folder_edit.text().strip()
+        if not folder:
+            QMessageBox.warning(
+                self, "Missing Output Folder", "Please select an output folder."
+            )
             return None
-
-        if not Path(input_folder).exists():
-            QMessageBox.warning(self, "Invalid Input Folder", f"The input folder does not exist:\n{input_folder}")
+        if not Path(folder).exists():
+            QMessageBox.warning(
+                self, "Invalid Output Folder",
+                f"The output folder does not exist:\n{folder}",
+            )
             return None
+        return folder
 
-        if not output_folder:
-            QMessageBox.warning(self, "Missing Output Folder", "Please select an output folder.")
-            return None
+    @staticmethod
+    def _overlaps_source(kind: str, path: str, output_folder: str) -> bool:
+        target = path if kind == "dir" else str(Path(path).parent)
+        return os.path.abspath(target) == os.path.abspath(output_folder)
 
-        if not Path(output_folder).exists():
-            QMessageBox.warning(self, "Invalid Output Folder", f"The output folder does not exist:\n{output_folder}")
-            return None
+    def _confirm_no_overlap(self, sources: list[tuple[str, str]], output_folder: str) -> bool:
+        for kind, path in sources:
+            if self._overlaps_source(kind, path, output_folder):
+                reply = QMessageBox.question(
+                    self,
+                    "Output Inside Source",
+                    "The output folder is the same as a source folder.\n"
+                    "Result files may appear in future compilations.\n\nContinue anyway?",
+                )
+                return reply == QMessageBox.StandardButton.Yes
+        return True
 
-        return input_folder, output_folder
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _on_compile_clicked(self) -> None:
+        sources = self.source_list.get_sources()
+        if not sources:
+            QMessageBox.warning(
+                self, "No Sources",
+                "Add at least one video file or folder to compile.",
+            )
+            return
+
+        output_folder = self._validated_output_folder()
+        if output_folder is None:
+            return
+        if not self._confirm_no_overlap(sources, output_folder):
+            return
+
+        total_dur_seconds = self.total_duration_spin.value() * 60
+        clip_dur = self.clip_duration_spin.value()
+        if clip_dur > total_dur_seconds:
+            QMessageBox.warning(
+                self,
+                "Invalid Clip Duration",
+                "Duration per clip cannot be greater than the total compilation duration.",
+            )
+            return
+
+        encoder = self._effective_encoder_display()
+
+        self._set_processing_state(True)
+        self.append_log("Starting clip compilation...")
+        self.compilation_requested.emit(
+            sources, output_folder, total_dur_seconds, clip_dur, encoder
+        )
+
+    def _on_silence_clicked(self) -> None:
+        file_path = self.silence_file_edit.text().strip()
+        if not file_path:
+            QMessageBox.warning(
+                self, "Missing Media File",
+                "Please drop or browse for a media file.",
+            )
+            return
+        if not Path(file_path).exists():
+            QMessageBox.warning(
+                self, "Invalid Media File",
+                f"The selected file does not exist:\n{file_path}",
+            )
+            return
+
+        output_folder = self._validated_output_folder()
+        if output_folder is None:
+            return
+        if not self._confirm_no_overlap([("file", file_path)], output_folder):
+            return
+
+        encoder = self._effective_encoder_display()
+        threshold_db = self.threshold_spin.value()
+        min_duration = self.min_duration_spin.value()
+        padding = self.padding_spin.value()
+
+        self._set_processing_state(True)
+        self.append_log("Starting silence removal...")
+        self.silence_removal_requested.emit(
+            file_path, output_folder, encoder, threshold_db, min_duration, padding
+        )
+
+    def _on_cancel_clicked(self) -> None:
+        self.cancel_button.setText("Cancelling...")
+        self.cancel_button.setEnabled(False)
+        self.append_log("Cancellation requested...")
+        self.cancellation_requested.emit()
+
+    # ------------------------------------------------------------------
+    # Processing state
+    # ------------------------------------------------------------------
 
     def _set_processing_state(self, processing: bool) -> None:
+        self._processing = processing
         self.compile_button.setEnabled(not processing)
         self.silence_button.setEnabled(not processing)
 
@@ -1075,98 +1655,90 @@ class MainWindow(QMainWindow):
             self.cancel_button.setVisible(True)
             self.cancel_button.setEnabled(True)
             self.cancel_button.setText("Cancel")
-            self.status_label.setText("Processing...")
             self.status_label.setStyleSheet("color: #2563EB;")
+            self.status_label.setText("Processing...")
             self._log_separator()
         else:
             self.progress_bar.setVisible(False)
             self.cancel_button.setVisible(False)
             self.cancel_button.setEnabled(True)
             self.cancel_button.setText("Cancel")
-            self.compile_button.setText("Start Compilation")
-            self.silence_button.setText("Remove Silence & Save")
-            self.status_label.setStyleSheet("color: #22C55E;")
-            if self.content_stack.currentIndex() == 0:
-                self.status_label.setText("Ready — Waiting for input folder...")
-            else:
-                self.status_label.setText("Ready — Waiting for video file...")
+            self._restore_status_label()
 
     def _log_separator(self) -> None:
         from datetime import datetime
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.append_log("")
         self.append_log(f"--- Session started at {timestamp} ---")
 
-    def _on_compile_clicked(self) -> None:
-        folders = self._validate_folders()
-        if folders is None:
+    # ------------------------------------------------------------------
+    # Dialogs
+    # ------------------------------------------------------------------
+
+    def _open_settings(self) -> None:
+        settings = self._settings()
+        engine = FFmpegEngine()
+        dialog = SettingsDialog(
+            self,
+            ffmpeg_dir=settings.value("ffmpeg_dir", "", type=str),
+            default_output=settings.value("default_output_folder", "", type=str),
+            version_info=engine.get_ffmpeg_version(),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            if getattr(self, "_settings_reset_requested", False):
+                self._settings_reset_requested = False
+                self.append_log("All settings have been reset. Restart to fully apply.")
             return
 
-        input_folder, output_folder = folders
-        total_dur_seconds = self.total_duration_spin.value() * 60
-        clip_dur = self.clip_duration_spin.value()
-        encoder = self.encoder_combo.currentText()
-        if encoder == "Auto (Detect)":
-            encoder = self._detect_gpu_encoder_display()
-            self.append_log(f"Auto-detected encoder: {encoder}")
+        new_dir = dialog.ffmpeg_dir_value()
+        new_default = dialog.default_output_value()
+        settings.setValue("ffmpeg_dir", new_dir)
+        settings.setValue("default_output_folder", new_default)
 
-        if clip_dur > total_dur_seconds:
-            QMessageBox.warning(
-                self,
-                "Invalid Clip Duration",
-                "Duration per clip cannot be greater than the total compilation duration.",
-            )
-            return
+        FFmpegEngine.default_binary_dir = new_dir or None
+        self.ffmpeg_override_changed.emit(new_dir)
+        self.append_log(
+            f"FFmpeg location updated: {new_dir or 'automatic'} "
+            f"(resolved: {engine.get_resolved_ffmpeg_path()})"
+        )
 
-        self.compile_button.setText("Processing...")
-        self._set_processing_state(True)
+    def _open_help(self) -> None:
+        if self._detected_key is None:
+            gpu_line = "GPU detection still running..."
+        elif self._detected_key == "cpu":
+            gpu_line = "CPU software encoding (no usable GPU encoder found)"
+        else:
+            gpu_line = GPU_DISPLAY_BY_KEY[self._detected_key]
 
-        self.append_log("Starting clip compilation...")
-        self.compilation_requested.emit(input_folder, output_folder, total_dur_seconds, clip_dur, encoder)
-
-    def _on_silence_clicked(self) -> None:
-        file_path = self.silence_file_edit.text().strip()
-        output_folder = self.output_folder_edit.text().strip()
-        encoder = self.silence_encoder_combo.currentText()
-        threshold_db = self.threshold_spin.value()
-        min_duration = self.min_duration_spin.value()
-        padding = self.padding_spin.value()
-
-        if encoder == "Auto (Detect)":
-            encoder = self._detect_gpu_encoder_display()
-            self.append_log(f"Auto-detected encoder: {encoder}")
-
-        if not file_path:
-            QMessageBox.warning(self, "Missing Video File", "Please drop or browse for a video file.")
-            return
-
-        if not Path(file_path).exists():
-            QMessageBox.warning(self, "Invalid Video File", f"The selected file does not exist:\n{file_path}")
-            return
-
-        if not output_folder:
-            QMessageBox.warning(self, "Missing Output Folder", "Please select an output folder.")
-            return
-
-        if not Path(output_folder).exists():
-            QMessageBox.warning(self, "Invalid Output Folder", f"The output folder does not exist:\n{output_folder}")
-            return
-
-        self.silence_button.setText("Processing...")
-        self._set_processing_state(True)
-
-        self.append_log("Starting silence removal...")
-        self.silence_removal_requested.emit(file_path, output_folder, encoder, threshold_db, min_duration, padding)
-
-    def _on_cancel_clicked(self) -> None:
-        self.cancel_button.setText("Cancelling...")
-        self.cancel_button.setEnabled(False)
-        self.append_log("Cancellation requested...")
-        self.cancellation_requested.emit()
+        engine = FFmpegEngine()
+        help_text = (
+            "<h3>Clip Compiler</h3>"
+            "<p>Add single video files and/or entire folders as sources. "
+            "Random non-overlapping clips are cut from each video and merged "
+            "into one compilation.</p>"
+            "<h3>Silence Removal</h3>"
+            "<p>Drop one media file (video or audio). Silent regions are removed "
+            "and the remaining parts are merged into a cleaned copy.</p>"
+            "<h3>Current Encoding</h3>"
+            f"<p>{gpu_line}<br>"
+            f"FFmpeg: {engine.get_resolved_ffmpeg_path()}</p>"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Help \u2014 Smart Video Compiler")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(help_text)
+        box.exec()
 
     # ------------------------------------------------------------------
     # Public slots
     # ------------------------------------------------------------------
+
+    def set_phase(self, message: str) -> None:
+        """Show a pipeline phase message while processing."""
+        if self._processing:
+            self.status_label.setText(message)
+
     def append_log(self, message: str) -> None:
         self.log_console.appendPlainText(message)
         self.log_console.verticalScrollBar().setValue(
@@ -1180,15 +1752,33 @@ class MainWindow(QMainWindow):
 
     def on_compilation_finished(self, output_path: str) -> None:
         self._set_processing_state(False)
-        self.append_log(f"Compilation finished: {output_path}")
-        QMessageBox.information(
-            self,
-            "Compilation Complete",
-            f"Your compiled video has been saved to:\n{output_path}",
-        )
+        self.append_log(f"Finished: {output_path}")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Completed")
+        box.setText(f"Saved to:\n{output_path}")
+        open_button = box.addButton("Open Folder", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        if box.clickedButton() is open_button:
+            folder = str(Path(output_path).parent)
+            try:
+                os.startfile(folder)
+            except OSError as exc:
+                self.append_log(f"Could not open folder \"{folder}\": {exc}")
 
     def on_compilation_error(self, error_message: str) -> None:
+        cancelled = error_message.strip() == "Cancelled by user."
         self._set_processing_state(False)
+        if cancelled:
+            self.status_label.setStyleSheet("color: #DC2626;")
+            self.status_label.setText("Cancelled by user.")
+            self.append_log("Operation cancelled.")
+            return
+
+        self.status_label.setStyleSheet("color: #DC2626;")
+        self.status_label.setText("Failed \u2014 see logs for details.")
         self.append_log(f"ERROR: {error_message}")
         QMessageBox.critical(
             self,

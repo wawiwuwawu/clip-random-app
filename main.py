@@ -7,11 +7,12 @@ SilenceRemovalWorker background threads.
 
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import QApplication
 
 from ui.main_window import MainWindow
+from core.ffmpeg_engine import FFmpegEngine
 from core.worker import CompilationWorker, SilenceRemovalWorker
 
 
@@ -30,18 +31,36 @@ class Application:
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
         self.app.setPalette(palette)
 
+        self._apply_ffmpeg_override()
+
         self.window = MainWindow()
         self._worker: CompilationWorker | SilenceRemovalWorker | None = None
 
-        # Wire both UI signals to their handlers
+        # Wire UI signals to their handlers
         self.window.compilation_requested.connect(self._on_compilation_requested)
         self.window.silence_removal_requested.connect(self._on_silence_removal_requested)
         self.window.cancellation_requested.connect(self._on_cancellation_requested)
+        self.window.ffmpeg_override_changed.connect(self._on_ffmpeg_override_changed)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _apply_ffmpeg_override() -> None:
+        """Load the Settings-dialog FFmpeg override into the engine class."""
+        override = QSettings("SmartVideoCompiler", "MainWindow").value(
+            "ffmpeg_dir", "", type=str
+        )
+        FFmpegEngine.default_binary_dir = override or None
+
+    # ------------------------------------------------------------------
+    def _on_ffmpeg_override_changed(self, directory: str) -> None:
+        """Apply a new FFmpeg location and refresh GPU detection."""
+        FFmpegEngine.default_binary_dir = directory or None
+        self.window.start_detection()
 
     # ------------------------------------------------------------------
     def _on_compilation_requested(
         self,
-        input_folder: str,
+        sources: list[tuple[str, str]],
         output_folder: str,
         total_duration: int,
         clip_duration: int,
@@ -49,7 +68,7 @@ class Application:
     ) -> None:
         """Create and launch a CompilationWorker (random clip mode)."""
         self._worker = CompilationWorker(
-            input_folder=input_folder,
+            sources=sources,
             output_folder=output_folder,
             total_duration=total_duration,
             clip_duration=clip_duration,
@@ -90,6 +109,7 @@ class Application:
         if self._worker is None:
             return
         self._worker.log_message.connect(self.window.append_log)
+        self._worker.phase_message.connect(self.window.set_phase)
         self._worker.progress_percent.connect(self.window.update_progress)
         self._worker.encoding_complete.connect(self.window.on_compilation_finished)
         self._worker.error_occurred.connect(self.window.on_compilation_error)

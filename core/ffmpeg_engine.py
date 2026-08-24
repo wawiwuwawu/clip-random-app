@@ -15,30 +15,84 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from typing import Callable, Optional
+
+_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+AUTO_ENCODER_LABEL = "Auto (Detect)"
+CPU_ENCODER_DISPLAY = "CPU Software (libx264)"
+
+ENCODER_DISPLAY_TO_KEY: dict[str, str] = {
+    "NVIDIA NVENC (h264_nvenc)": "nvenc",
+    "Intel QSV (h264_qsv)": "qsv",
+    "AMD AMF (h264_amf)": "amf",
+    CPU_ENCODER_DISPLAY: "cpu",
+}
+
+GPU_ENCODER_KEYS = ("nvenc", "qsv", "amf")
+GPU_CODEC_BY_KEY = {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "amf": "h264_amf"}
+GPU_DISPLAY_BY_KEY = {
+    "nvenc": "NVIDIA NVENC (h264_nvenc)",
+    "qsv": "Intel QSV (h264_qsv)",
+    "amf": "AMD AMF (h264_amf)",
+}
+
+
+def map_encoder_display(display_name: str) -> str:
+    """Map a UI combo-box display name to the short encoder key."""
+    return ENCODER_DISPLAY_TO_KEY.get((display_name or "").strip(), "cpu")
+
+
+def make_timestamp(moment: datetime | None = None) -> str:
+    """Filesystem-safe timestamp used in output file names."""
+    moment = moment or datetime.now()
+    return moment.strftime("%Y-%m-%d_%H%M%S")
+
+
+def compiler_output_name(stamp: str | None = None) -> str:
+    """Fixed-pattern stem for Clip Compiler outputs."""
+    return f"compiled_video_{stamp or make_timestamp()}"
+
+
+def silence_output_name(source_basename: str, extension: str, stamp: str | None = None) -> str:
+    """Fixed-pattern stem for Silence Removal outputs."""
+    return f"{source_basename}_cleaned_{stamp or make_timestamp()}{extension}"
 
 
 class FFmpegEngine:
     """Stateless engine that wraps common FFmpeg workflows."""
 
+    default_binary_dir: str | None = None
+
     def __init__(self) -> None:
         # External callers may replace this with a logging function.
         # Signature: log_callback(message: str) -> None
         self.log_callback: Optional[Callable[[str], None]] = None
+        self.binary_dir: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _ffmpeg_bin(name: str) -> str:
+    def _ffmpeg_bin(self, name: str) -> str:
+        """Resolve an ffmpeg/ffprobe binary path.
+
+        Order: instance override, class-wide override (Settings dialog),
+        PyInstaller --onedir directory, PyInstaller --onefile temp dir,
+        then the system PATH.
+        """
+        search_dirs: list[str] = []
+        if self.binary_dir:
+            search_dirs.append(self.binary_dir)
+        if FFmpegEngine.default_binary_dir:
+            search_dirs.append(FFmpegEngine.default_binary_dir)
         if getattr(sys, "frozen", False):
-            base = os.path.dirname(sys.executable)
-            candidate = os.path.join(base, f"{name}.exe")
-            if os.path.isfile(candidate):
-                return candidate
+            search_dirs.append(os.path.dirname(sys.executable))
         if hasattr(sys, "_MEIPASS"):
-            candidate = os.path.join(sys._MEIPASS, f"{name}.exe")
+            search_dirs.append(sys._MEIPASS)
+        for directory in search_dirs:
+            candidate = os.path.join(directory, f"{name}.exe")
             if os.path.isfile(candidate):
                 return candidate
         return name
@@ -59,7 +113,7 @@ class FFmpegEngine:
             full_desc = cmd_str
         # (The engine itself does not log here unless the caller's callback is set)
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            return subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
         except subprocess.CalledProcessError as exc:
             raise  # let callers handle
 
@@ -264,7 +318,7 @@ class FFmpegEngine:
             file_path,
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
             return result.stdout.strip() == ""
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
@@ -431,7 +485,7 @@ class FFmpegEngine:
         self._log(f"Cutting clip: {cmd_str}")
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
             # Verify output file is not truncated
             if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
                 self._log(f"Clip \"{output_path}\" was truncated (size < 1 KB)")
@@ -495,7 +549,7 @@ class FFmpegEngine:
                     clip_paths[0],
                 ],
                 capture_output=True, text=True, check=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=_CREATE_NO_WINDOW,
             )
             target_w, target_h = r.stdout.strip().split("x")
         except Exception:
@@ -542,7 +596,7 @@ class FFmpegEngine:
 
             try:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
                 return True
             except subprocess.CalledProcessError as exc:
                 self._log(f"Concatenation failed ({label}): exit code {exc.returncode}")
@@ -619,7 +673,7 @@ class FFmpegEngine:
 
         try:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
             return True
         except subprocess.CalledProcessError as exc:
             self._log(f"Audio concatenation failed: {exc}")
@@ -650,3 +704,88 @@ class FFmpegEngine:
             self._log(f"Cleaned up temporary directory: \"{temp_dir}\"")
         except Exception as exc:
             self._log(f"Cleanup warning for \"{temp_dir}\": {exc}")
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def get_resolved_ffmpeg_path(self) -> str:
+        """Return the resolved ffmpeg binary path (for diagnostics)."""
+        return self._ffmpeg_bin("ffmpeg")
+
+    def get_ffmpeg_version(self) -> str:
+        """Return the first line of ``ffmpeg -version`` for display."""
+        try:
+            result = subprocess.run(
+                [self._ffmpeg_bin("ffmpeg"), "-version"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            lines = result.stdout.strip().splitlines()
+            if lines:
+                return lines[0].strip()
+        except Exception as exc:
+            self._log(f"Could not query ffmpeg version: {exc}")
+        return "ffmpeg not found"
+
+    # ------------------------------------------------------------------
+    # GPU encoder detection
+    # ------------------------------------------------------------------
+
+    def detect_gpu_encoder(self) -> str:
+        """Detect the best usable hardware H.264 encoder.
+
+        Two-step check:
+        1. The ffmpeg binary must list ``h264_<key>`` among its encoders.
+        2. A real 0.2-second encode must succeed (driver / session check).
+
+        Returns one of ``"nvenc"``, ``"qsv"``, ``"amf"`` or ``"cpu"``.
+        """
+        binary = self._ffmpeg_bin("ffmpeg")
+        self._log(f"Detecting GPU encoder (ffmpeg: {binary})...")
+
+        try:
+            result = subprocess.run(
+                [binary, "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            listing = (result.stdout + result.stderr).lower()
+        except Exception as exc:
+            self._log(f"Encoder detection failed ({exc}) — using CPU.")
+            return "cpu"
+
+        present = [key for key in GPU_ENCODER_KEYS if f"h264_{key}" in listing]
+        if not present:
+            self._log("No hardware encoders in this ffmpeg build — using CPU.")
+            return "cpu"
+
+        for key in present:
+            if self._probe_encoder(key, binary):
+                self._log(f"GPU encoder detected and verified: {GPU_DISPLAY_BY_KEY[key]}")
+                return key
+
+        self._log("Hardware encoders listed but none initialized — using CPU.")
+        return "cpu"
+
+    def _probe_encoder(self, key: str, binary: str) -> bool:
+        """Run a tiny real encode to verify a hardware encoder works."""
+        codec = GPU_CODEC_BY_KEY[key]
+        cmd = [
+            binary, "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi",
+            "-i", "color=c=black:s=256x256:d=0.2:r=30",
+            "-c:v", codec,
+            "-frames:v", "3",
+            "-f", "null", "-",
+        ]
+        try:
+            subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            self._log(f"Probe {codec}: OK")
+            return True
+        except Exception as exc:
+            self._log(f"Probe {codec} failed: {exc}")
+            return False
