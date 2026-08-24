@@ -21,6 +21,7 @@ from PySide6.QtCore import QThread, Signal
 from core.clip_plan import ClipEntry, ClipSession
 from core.ffmpeg_engine import (
     FFmpegEngine,
+    build_noise_filters,
     compiler_output_name,
     map_encoder_display,
     make_timestamp,
@@ -429,6 +430,7 @@ class SilenceRemovalWorker(QThread):
         threshold_db: int = -30,
         min_duration: float = 0.5,
         padding: float = 0.0,
+        denoise: Optional[dict] = None,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
@@ -438,6 +440,7 @@ class SilenceRemovalWorker(QThread):
         self.threshold_db = threshold_db
         self.min_duration = min_duration
         self.padding = padding
+        self.denoise = denoise or {}
 
         self.engine = FFmpegEngine()
         self.engine.log_callback = self.log_message.emit
@@ -588,6 +591,17 @@ class SilenceRemovalWorker(QThread):
         self.phase_message.emit("Concatenating & encoding...")
         self.progress_percent.emit(80)
 
+        audio_filters = None
+        if self.denoise.get("enabled"):
+            mode = self.denoise.get("mode", "fft")
+            strength = self.denoise.get("strength", "medium")
+            audio_filters = build_noise_filters(mode, strength)
+            self.log_message.emit(
+                f"Applying noise removal (mode={mode}"
+                + (f", strength={strength}" if mode != "ai" else "")
+                + ")..."
+            )
+
         out_path = self._resolve_output_path(audio_only)
         self.log_message.emit(f"Encoding \"{os.path.basename(out_path)}\"...")
 
@@ -599,12 +613,14 @@ class SilenceRemovalWorker(QThread):
             concat_ok = self.engine.concat_audio_clips(
                 clip_paths=clip_paths,
                 output_path=out_path,
+                audio_filters=audio_filters,
             )
         else:
             concat_ok = self.engine.concat_clips(
                 clip_paths=clip_paths,
                 output_path=out_path,
                 encoder=map_encoder_display(self.encoder),
+                audio_filters=audio_filters,
             )
 
         if not concat_ok:

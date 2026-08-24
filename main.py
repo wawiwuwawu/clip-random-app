@@ -184,6 +184,9 @@ class Application:
         threshold_db: int,
         min_duration: float,
         padding: float,
+        noise_on: bool = False,
+        noise_mode: str = "fft",
+        noise_strength: str = "medium",
     ) -> None:
         self._submit(
             SilenceRemovalWorker(
@@ -193,6 +196,11 @@ class Application:
                 threshold_db=threshold_db,
                 min_duration=min_duration,
                 padding=padding,
+                denoise={
+                    "enabled": noise_on,
+                    "mode": noise_mode,
+                    "strength": noise_strength,
+                },
             )
         )
 

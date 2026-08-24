@@ -62,6 +62,54 @@ def silence_output_name(source_basename: str, extension: str, stamp: str | None 
     return f"{source_basename}_cleaned_{stamp or make_timestamp()}{extension}"
 
 
+NOISE_MODEL_FILENAME = "mp.rnnn"
+
+
+def escape_filter_path(path: str) -> str:
+    """Make a Windows path safe inside an FFmpeg filtergraph option value."""
+    return path.replace("\\", "/").replace(":", "\\:")
+
+
+def resolve_noise_model_path(name: str = NOISE_MODEL_FILENAME) -> str:
+    """Locate the bundled RNNoise model (dev cwd, frozen dir, or _MEIPASS)."""
+    search_dirs: list[str] = [os.path.join(os.getcwd(), "assets", "models")]
+    if getattr(sys, "frozen", False):
+        search_dirs.append(
+            os.path.join(os.path.dirname(sys.executable), "assets", "models")
+        )
+    if hasattr(sys, "_MEIPASS"):
+        search_dirs.append(os.path.join(sys._MEIPASS, "assets", "models"))
+        search_dirs.append(sys._MEIPASS)
+    for directory in search_dirs:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return name
+
+
+def build_noise_filters(mode: str, strength: str) -> list[str]:
+    """
+    Build the audio-filter chain for background-noise removal.
+
+    ``mode="fft"`` uses the built-in afftdn denoiser scaled by *strength*;
+    ``mode="ai"`` uses the RNNoise neural filter with the bundled model.
+    """
+    if (mode or "").lower() == "ai":
+        model = resolve_noise_model_path()
+        return [f"arnndn=m='{escape_filter_path(model)}'"]
+
+    presets = {
+        "light": ["highpass=f=80", "afftdn=nr=14:nf=-45"],
+        "medium": ["highpass=f=90", "afftdn=nr=24:nf=-40:tn=1:tr=1"],
+        "strong": [
+            "highpass=f=100",
+            "lowpass=f=14000",
+            "afftdn=nr=34:nf=-36:tn=1:tr=1",
+        ],
+    }
+    return presets.get((strength or "medium").lower(), presets["medium"])
+
+
 class FFmpegEngine:
     """Stateless engine that wraps common FFmpeg workflows."""
 
@@ -565,6 +613,7 @@ class FFmpegEngine:
         durations: Optional[list[float]] = None,
         aspect: str = "landscape",
         crossfade: float = 0.0,
+        audio_filters: Optional[list[str]] = None,
     ) -> bool:
         """
         Concatenate clips using ffmpeg's concat filter (filter_complex).
@@ -572,7 +621,8 @@ class FFmpegEngine:
         ``aspect="portrait"`` renders 1080x1920 with a blurred background fill;
         ``crossfade > 0`` joins clips with an xfade/acrossfade chain instead of
         a hard cut (requires *durations*). HEVC encoder keys emit ``hvc1``
-        tagged output for broader player support.
+        tagged output for broader player support. ``audio_filters`` (e.g.
+        noise-removal chains) wrap every input's audio stream before mixing.
         """
         encoder_map: dict[str, dict] = {
             "nvenc": {
@@ -639,6 +689,15 @@ class FFmpegEngine:
 
         # --- Build filter_complex ---
         filter_lines: list[str] = []
+
+        def _src_audio(i: int) -> str:
+            return f"[af{i}]" if audio_filters else f"[{i}:a]"
+
+        if audio_filters:
+            chain = ",".join(audio_filters)
+            for i in range(n):
+                filter_lines.append(f"[{i}:a]{chain}[af{i}]")
+
         for i in range(n):
             if aspect == "portrait":
                 chain = (
@@ -662,7 +721,7 @@ class FFmpegEngine:
         if use_xfade:
             fade = float(crossfade)
             length = (durations or [])[0]
-            prev_v, prev_a = "[v0]", "[0:a]"
+            prev_v, prev_a = "[v0]", _src_audio(0)
             for i in range(1, n):
                 is_last = i == n - 1
                 vx = "[outv]" if is_last else f"[vx{i}]"
@@ -673,13 +732,15 @@ class FFmpegEngine:
                     f":duration={fade:.3f}:offset={offset:.3f}{vx}"
                 )
                 filter_lines.append(
-                    f"{prev_a}[{i}:a]acrossfade=d={fade:.3f}{ax}"
+                    f"{prev_a}{_src_audio(i)}acrossfade=d={fade:.3f}{ax}"
                 )
                 length = offset + (durations or [])[i]
                 prev_v, prev_a = vx, ax
         else:
-            # concat filter requires INTERLEAVED inputs: [v0][0:a][v1][1:a]...
-            concat_inputs = "".join(f"[v{i}][{i}:a]" for i in range(n))
+            # concat filter requires INTERLEAVED inputs: [v0][a0][v1][a1]...
+            concat_inputs = "".join(
+                f"[v{i}]{_src_audio(i)}" for i in range(n)
+            )
             filter_lines.append(
                 f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
             )
@@ -738,6 +799,7 @@ class FFmpegEngine:
         self,
         clip_paths: list[str],
         output_path: str,
+        audio_filters: Optional[list[str]] = None,
     ) -> bool:
         """
         Concatenate audio-only clips into a single audio file using ffmpeg's
@@ -749,6 +811,9 @@ class FFmpegEngine:
             Ordered list of audio clip file paths to concatenate.
         output_path : str
             Destination path for the final audio file (e.g. ``.m4a``).
+        audio_filters : list[str], optional
+            Audio filter chain (e.g. noise removal) applied once after the
+            concatenated stream is decoded.
 
         Returns
         -------
@@ -774,11 +839,15 @@ class FFmpegEngine:
             "-f", "concat",
             "-safe", "0",
             "-i", concat_list_path,
+        ]
+        if audio_filters:
+            cmd.extend(["-af", ",".join(audio_filters)])
+        cmd.extend([
             "-c:a", "aac",
             "-b:a", "128k",
             "-vn",
             output_path,
-        ]
+        ])
         cmd_str = " ".join(str(c) for c in cmd)
         self._log(f"Concatenating audio clips: {cmd_str}")
 

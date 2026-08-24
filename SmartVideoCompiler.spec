@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffmpeg.exe', '.'), ('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffprobe.exe', '.')],
+    datas=[('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffmpeg.exe', '.'), ('ffmpeg-2026-07-02-git-95a888b9ca-full_build\\bin\\ffprobe.exe', '.'), ('assets\\models\\mp.rnnn', 'assets/models')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

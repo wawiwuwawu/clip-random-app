@@ -498,6 +498,9 @@ class MainWindow(QMainWindow):
     threshold_spin: NoWheelSpinBox
     min_duration_spin: NoWheelDoubleSpinBox
     padding_spin: NoWheelDoubleSpinBox
+    noise_check: QPushButton
+    noise_mode_combo: NoWheelComboBox
+    noise_strength_combo: NoWheelComboBox
     compile_button: QPushButton
     silence_button: QPushButton
     cancel_button: QPushButton
@@ -509,7 +512,7 @@ class MainWindow(QMainWindow):
     plan_requested = Signal(list, str, int, int, str, bool, bool, float)
     render_requested = Signal(object)
     discard_session_requested = Signal(object)
-    silence_removal_requested = Signal(str, str, str, int, float, float)
+    silence_removal_requested = Signal(str, str, str, int, float, float, bool, str, str)
     cancellation_requested = Signal()
     ffmpeg_override_changed = Signal(str)
 
@@ -824,13 +827,56 @@ class MainWindow(QMainWindow):
         self.padding_spin.setDecimals(1)
         self.padding_spin.setFixedWidth(90)
 
+        noise_mode_label = QLabel("Denoise Mode")
+        noise_mode_label.setObjectName("field-label")
+        noise_mode_label.setFixedWidth(160)
+        self.noise_mode_combo = NoWheelComboBox()
+        self.noise_mode_combo.addItem("FFT (fast)")
+        self.noise_mode_combo.addItem("AI RNNoise (best for voice)")
+        self.noise_mode_combo.setFixedWidth(260)
+        self.noise_mode_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        noise_strength_label = QLabel("Strength")
+        noise_strength_label.setObjectName("field-label")
+        noise_strength_label.setFixedWidth(160)
+        self.noise_strength_combo = NoWheelComboBox()
+        self.noise_strength_combo.addItems(["Light", "Medium", "Strong"])
+        self.noise_strength_combo.setCurrentIndex(1)
+        self.noise_strength_combo.setFixedWidth(260)
+        self.noise_strength_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         params_grid.addWidget(threshold_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         params_grid.addWidget(self.threshold_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         params_grid.addWidget(min_dur_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         params_grid.addWidget(self.min_duration_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         params_grid.addWidget(padding_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         params_grid.addWidget(self.padding_spin, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.noise_check = QPushButton("Remove background noise")
+        self.noise_check.setObjectName("check-pill")
+        self.noise_check.setCheckable(True)
+        self.noise_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.noise_check.toggled.connect(self._on_noise_toggled)
+
+        self.noise_mode_label = noise_mode_label
+        self.noise_strength_label = noise_strength_label
+
+        params_grid.addWidget(self.noise_check, 3, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_grid.addWidget(noise_mode_label, 4, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.noise_mode_combo, 4, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        params_grid.addWidget(noise_strength_label, 5, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        params_grid.addWidget(self.noise_strength_combo, 5, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         params_layout.addLayout(params_grid)
+
+        self.noise_hint = QLabel(
+            "FFT: fast, good against hiss/fan noise. "
+            "AI RNNoise: best clarity for voice content."
+        )
+        self.noise_hint.setObjectName("hint-label")
+        self.noise_hint.setWordWrap(True)
+        params_layout.addWidget(self.noise_hint)
+
+        self._set_noise_controls_visible(False)
 
         layout.addWidget(params_card)
 
@@ -1435,6 +1481,21 @@ class MainWindow(QMainWindow):
         if not self._loading:
             self._save_settings()
 
+    def _on_noise_toggled(self, checked: bool) -> None:
+        self._set_noise_controls_visible(checked)
+        if not self._loading:
+            self._save_settings()
+
+    def _set_noise_controls_visible(self, visible: bool) -> None:
+        for widget in (
+            self.noise_mode_label,
+            self.noise_mode_combo,
+            self.noise_strength_label,
+            self.noise_strength_combo,
+            self.noise_hint,
+        ):
+            widget.setVisible(visible)
+
     # ------------------------------------------------------------------
     # Settings persistence
     # ------------------------------------------------------------------
@@ -1496,6 +1557,16 @@ class MainWindow(QMainWindow):
         self.min_duration_spin.setValue(float(settings.value("min_duration", 0.5)))
         self.padding_spin.setValue(float(settings.value("padding", 0.0)))
 
+        self.noise_check.setChecked(settings.value("noise_enabled", False, type=bool))
+        noise_mode = settings.value("noise_mode", "FFT (fast)", type=str)
+        noise_index = self.noise_mode_combo.findText(noise_mode)
+        if noise_index >= 0:
+            self.noise_mode_combo.setCurrentIndex(noise_index)
+        strength = settings.value("noise_strength", "Medium", type=str)
+        strength_index = self.noise_strength_combo.findText(strength)
+        if strength_index >= 0:
+            self.noise_strength_combo.setCurrentIndex(strength_index)
+
         last_media = settings.value("last_media_file", "", type=str)
         if last_media and Path(last_media).exists():
             self.silence_file_edit.setText(last_media)
@@ -1517,6 +1588,9 @@ class MainWindow(QMainWindow):
         settings.setValue("threshold_db", self.threshold_spin.value())
         settings.setValue("min_duration", self.min_duration_spin.value())
         settings.setValue("padding", self.padding_spin.value())
+        settings.setValue("noise_enabled", self.noise_check.isChecked())
+        settings.setValue("noise_mode", self.noise_mode_combo.currentText())
+        settings.setValue("noise_strength", self.noise_strength_combo.currentText())
         settings.setValue("last_media_file", self.silence_file_edit.text().strip())
         settings.sync()
 
@@ -1776,9 +1850,16 @@ class MainWindow(QMainWindow):
         min_duration = self.min_duration_spin.value()
         padding = self.padding_spin.value()
 
+        noise_on = self.noise_check.isChecked()
+        noise_mode = (
+            "ai" if "ai" in self.noise_mode_combo.currentText().lower() else "fft"
+        )
+        noise_strength = self.noise_strength_combo.currentText().lower()
+
         self.append_log("Starting silence removal...")
         self.silence_removal_requested.emit(
-            file_path, output_folder, encoder, threshold_db, min_duration, padding
+            file_path, output_folder, encoder, threshold_db,
+            min_duration, padding, noise_on, noise_mode, noise_strength,
         )
 
     def _on_cancel_clicked(self) -> None:
