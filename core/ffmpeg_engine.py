@@ -526,6 +526,7 @@ class FFmpegEngine:
     # ------------------------------------------------------------------
     THUMB_W = 240
     THUMB_H_PORTRAIT = 426
+    PORTRAIT_ZOOM = 1.5
 
     def generate_thumbnail(
         self,
@@ -536,10 +537,14 @@ class FFmpegEngine:
     ) -> bool:
         """Extract one small preview frame from *video_path*."""
         if portrait:
+            th_w, th_h = self.THUMB_W, self.THUMB_H_PORTRAIT
+            fg_w = int(th_w * self.PORTRAIT_ZOOM)
             vf = (
-                f"scale={self.THUMB_W}:{self.THUMB_H_PORTRAIT}"
-                f":force_original_aspect_ratio=increase,"
-                f"crop={self.THUMB_W}:{self.THUMB_H_PORTRAIT}"
+                f"split[bga][fga];"
+                f"[bga]scale={th_w}:{th_h}:force_original_aspect_ratio=increase,"
+                f"crop={th_w}:{th_h},gblur=sigma=4[bg];"
+                f"[fga]scale={fg_w}:-2[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
             )
         else:
             vf = f"scale={self.THUMB_W}:-2"
@@ -729,12 +734,13 @@ class FFmpegEngine:
 
         for i in range(n):
             if aspect == "portrait":
+                zoom_w = int(int(target_w) * self.PORTRAIT_ZOOM)
                 chain = (
                     f"[{i}:v]split=2[bga{i}][fga{i}]"
                     f";[bga{i}]scale={target_w}:{target_h}"
                     f":force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
                     f",gblur=sigma=12[bg{i}]"
-                    f";[fga{i}]scale={target_w}:-2[fg{i}]"
+                    f";[fga{i}]scale={zoom_w}:-2[fg{i}]"
                     f";[bg{i}][fg{i}]overlay=(W-w)/2:(H-h)/2,setsar=1"
                 )
             else:
