@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "Smart Video Compiler"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "wawunime"
 #define MyAppURL "https://web.wawunime.my.id/"
 #define MyAppExeName "SmartVideoCompiler.exe"
@@ -32,9 +32,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 ; Uncomment the following line to run in non administrative install mode (install for current user only).
 ;PrivilegesRequired=lowest
-OutputDir=C:\laragon\www\Smart Video Compiler
+OutputDir=.
 OutputBaseFilename=SmartVideoCompiler_Setup
-SetupIconFile=C:\laragon\www\Smart Video Compiler\icon-SmartVideoCompiler.ico
+SetupIconFile=.\icon-SmartVideoCompiler.ico
 SolidCompression=yes
 WizardStyle=modern dynamic
 
@@ -45,8 +45,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "C:\laragon\www\Smart Video Compiler\dist\SmartVideoCompiler\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\laragon\www\Smart Video Compiler\dist\SmartVideoCompiler\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\SmartVideoCompiler\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\SmartVideoCompiler\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [UninstallDelete]
