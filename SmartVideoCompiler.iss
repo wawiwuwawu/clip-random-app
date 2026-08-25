@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "Smart Video Compiler"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "wawunime"
 #define MyAppURL "https://web.wawunime.my.id/"
 #define MyAppExeName "SmartVideoCompiler.exe"

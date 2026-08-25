@@ -39,6 +39,10 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller SmartVideoCompiler.spec --noconfirm
 
+      - name: Zip portable build
+        shell: pwsh
+        run: Compress-Archive -Path dist\SmartVideoCompiler\* -DestinationPath SmartVideoCompiler_Portable.zip
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
@@ -50,14 +54,18 @@ jobs:
           if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
           & $iscc SmartVideoCompiler.iss
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SmartVideoCompiler_Setup
-          path: SmartVideoCompiler_Setup.exe
+          name: SmartVideoCompiler-build
+          path: |
+            SmartVideoCompiler_Setup.exe
+            SmartVideoCompiler_Portable.zip
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: SmartVideoCompiler_Setup.exe
+          files: |
+            SmartVideoCompiler_Setup.exe
+            SmartVideoCompiler_Portable.zip
