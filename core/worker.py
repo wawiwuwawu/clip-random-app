@@ -408,6 +408,151 @@ class ClipRenderWorker(QThread):
         self.error_occurred.emit("Cancelled by user.")
 
 
+class TranscribeWorker(QThread):
+    """Standalone transcription: any media file → .srt + .txt."""
+
+    kind = "transcribe"
+
+    log_message = Signal(str)
+    phase_message = Signal(str)
+    progress_percent = Signal(int)
+    encoding_complete = Signal(str)   # srt path
+    error_occurred = Signal(str)
+
+    # ------------------------------------------------------------------
+    def __init__(
+        self,
+        media_path: str,
+        output_folder: str,
+        model_size: str = "small",
+        language: str | None = None,
+        parent: Optional[object] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.media_path = media_path
+        self.output_folder = output_folder
+        self.model_size = model_size
+        self.language = language
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _unique_path(path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        counter = 1
+        while os.path.exists(f"{stem}_{counter}{ext}"):
+            counter += 1
+        return f"{stem}_{counter}{ext}"
+
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        try:
+            self._pipeline()
+        except Exception as exc:
+            tb = traceback.format_exc()
+            self.log_message.emit(f"Unexpected error: {exc}\n{tb}")
+            self.error_occurred.emit(str(exc))
+
+    def _pipeline(self) -> None:
+        # 1. Validate (0-5 %) --------------------------------------------
+        self.progress_percent.emit(0)
+        self.phase_message.emit("Validating input file...")
+        self.log_message.emit("Validating input media file...")
+
+        if not os.path.isfile(self.media_path):
+            msg = f"Media file not found: \"{self.media_path}\""
+            self.log_message.emit(msg)
+            self.error_occurred.emit(msg)
+            return
+
+        filename = os.path.basename(self.media_path)
+        self.log_message.emit(f"Input: \"{filename}\"")
+        self.progress_percent.emit(5)
+
+        if self.isInterruptionRequested():
+            self._emit_cancelled()
+            return
+
+        # 2. Model prep (5-15 %, busy while downloading) ------------------
+        if not subtitles_mod.is_available():
+            detail = subtitles_mod.import_error_detail()
+            reason = (
+                "faster-whisper failed to import.\n" + (detail or "")
+                if detail
+                else "faster-whisper is not available in this interpreter."
+            )
+            self.log_message.emit(reason)
+            self.error_occurred.emit(reason)
+            return
+
+        os.makedirs(self.output_folder, exist_ok=True)
+
+        # 3. Transcribe (15-90 %) ----------------------------------------
+        try:
+            cues, detected = subtitles_mod.transcribe(
+                self.media_path,
+                model_size=self.model_size,
+                language=self.language,
+                cancel_check=self.isInterruptionRequested,
+                log=self.log_message.emit,
+                status_cb=self.phase_message.emit,
+                progress_cb=lambda frac: self.progress_percent.emit(
+                    -1 if frac < 0 else 15 + int(min(1.0, max(0.0, frac)) * 75)
+                ),
+                dl_progress_cb=lambda frac: self.progress_percent.emit(
+                    5 + int(min(1.0, max(0.0, frac)) * 10)
+                ),
+            )
+        except Exception as exc:
+            msg = f"Transcription failed: {exc}"
+            self.log_message.emit(msg)
+            self.error_occurred.emit(msg)
+            return
+
+        if self.isInterruptionRequested():
+            self._emit_cancelled()
+            return
+
+        if not cues:
+            msg = (
+                f"No speech detected in \"{filename}\". "
+                "Try a different Whisper model or check the audio."
+            )
+            self.log_message.emit(msg)
+            self.error_occurred.emit(msg)
+            return
+
+        self.log_message.emit(
+            f"{len(cues)} cue(s) transcribed (language={detected or '?'})"
+        )
+
+        # 4. Write outputs (90-95 %) -------------------------------------
+        self.phase_message.emit("Writing subtitle files...")
+        self.progress_percent.emit(90)
+
+        stem = os.path.splitext(filename)[0]
+        srt_path = self._unique_path(os.path.join(self.output_folder, stem + ".srt"))
+        txt_path = self._unique_path(os.path.join(self.output_folder, stem + ".txt"))
+
+        subtitles_mod.write_srt(cues, srt_path)
+        subtitles_mod.write_txt(cues, txt_path)
+
+        self.log_message.emit(f"Saved: \"{os.path.basename(srt_path)}\"")
+        self.log_message.emit(f"Saved: \"{os.path.basename(txt_path)}\"")
+        self.progress_percent.emit(95)
+
+        # 5. Done (95-100 %) ----------------------------------------------
+        self.phase_message.emit("Done.")
+        self.progress_percent.emit(100)
+        self.encoding_complete.emit(srt_path)
+
+    # ------------------------------------------------------------------
+    def _emit_cancelled(self) -> None:
+        self.log_message.emit("Cancelled by user.")
+        self.error_occurred.emit("Cancelled by user.")
+
+
 class SilenceRemovalWorker(QThread):
     """Runs the silence-removal pipeline on a background thread.
 

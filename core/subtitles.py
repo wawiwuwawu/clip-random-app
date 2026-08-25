@@ -197,9 +197,8 @@ def _model_cached(model_size: str) -> bool:
         return False
 
 
-def transcribe_to_srt(
+def transcribe(
     media_path: str,
-    srt_path: str,
     model_size: str = "small",
     language: str | None = None,
     progress_cb=None,
@@ -207,16 +206,14 @@ def transcribe_to_srt(
     log=None,
     status_cb=None,
     dl_progress_cb=None,
-) -> tuple[int, str | None]:
+) -> tuple[list[tuple[float, float, str]], str | None]:
     """
-    Transcribe *media_path* and write an SRT file to *srt_path*.
+    Transcribe *media_path* into ``(cues, detected_language)``.
 
-    ``progress_cb`` receives segment completion as 0..1, and ``-1`` while a
-    download is in progress (busy indicator). ``dl_progress_cb`` receives
-    CUDA library download fraction as 0..1.
-
-    Returns ``(cue_count, detected_language_or_None)``.
-    Raises RuntimeError when faster-whisper is not installed.
+    Each cue is ``(start_sec, end_sec, text)``. ``progress_cb`` receives
+    segment completion as 0..1, and ``-1`` while a download is in progress
+    (busy indicator). ``dl_progress_cb`` receives the CUDA library download
+    fraction as 0..1. Raises RuntimeError when faster-whisper is missing.
     """
     log = log or (lambda msg: None)
     status_cb = status_cb or (lambda msg: None)
@@ -257,14 +254,46 @@ def transcribe_to_srt(
         cues.append((float(segment.start), float(segment.end), text))
         progress_cb(min(1.0, segment.end / max(info.duration, 0.1)))
 
+    detected = getattr(info, "language", None)
+    return cues, detected
+
+
+def write_srt(cues: list[tuple[float, float, str]], srt_path: str) -> None:
     lines: list[str] = []
     for index, (start, end, text) in enumerate(cues, start=1):
         lines.append(str(index))
         lines.append(f"{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}")
         lines.append(text)
         lines.append("")
-
     Path(srt_path).write_text("\n".join(lines), encoding="utf-8")
 
-    detected = getattr(info, "language", None)
+
+def write_txt(cues: list[tuple[float, float, str]], txt_path: str) -> None:
+    """Plain-text transcript: one line per cue."""
+    Path(txt_path).write_text(
+        "\n".join(text for _, _, text in cues) + "\n", encoding="utf-8"
+    )
+
+
+def transcribe_to_srt(
+    media_path: str,
+    srt_path: str,
+    model_size: str = "small",
+    language: str | None = None,
+    progress_cb=None,
+    cancel_check=None,
+    log=None,
+    status_cb=None,
+    dl_progress_cb=None,
+) -> tuple[int, str | None]:
+    """
+    Backward-compatible wrapper: transcribe *media_path* and write an SRT
+    file to *srt_path*. Returns ``(cue_count, detected_language_or_None)``.
+    """
+    cues, detected = transcribe(
+        media_path, model_size=model_size, language=language,
+        progress_cb=progress_cb, cancel_check=cancel_check,
+        log=log, status_cb=status_cb, dl_progress_cb=dl_progress_cb,
+    )
+    write_srt(cues, srt_path)
     return len(cues), detected

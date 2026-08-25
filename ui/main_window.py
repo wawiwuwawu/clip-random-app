@@ -528,6 +528,12 @@ class MainWindow(QMainWindow):
     subtitle_check: QPushButton
     subtitle_model_combo: NoWheelComboBox
     subtitle_lang_combo: NoWheelComboBox
+    transcribe_pill: QPushButton
+    transcribe_drop_zone: DropZone
+    transcribe_file_edit: QLineEdit
+    transcribe_model_combo: NoWheelComboBox
+    transcribe_lang_combo: NoWheelComboBox
+    transcribe_button: QPushButton
     compile_button: QPushButton
     silence_button: QPushButton
     cancel_button: QPushButton
@@ -540,6 +546,7 @@ class MainWindow(QMainWindow):
     render_requested = Signal(object)
     discard_session_requested = Signal(object)
     silence_removal_requested = Signal(str, str, str, int, float, float, dict, dict)
+    transcribe_requested = Signal(str, str, str, str)
     cancellation_requested = Signal()
     ffmpeg_override_changed = Signal(str)
 
@@ -628,14 +635,23 @@ class MainWindow(QMainWindow):
         self.silence_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         self.silence_pill.clicked.connect(self._show_silence_mode)
 
+        self.transcribe_pill = QPushButton("Transcribe")
+        self.transcribe_pill.setObjectName("mode-pill")
+        self.transcribe_pill.setCheckable(True)
+        self.transcribe_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.transcribe_pill.clicked.connect(self._show_transcribe_mode)
+
         pill_group = QButtonGroup(self)
         pill_group.setExclusive(True)
         pill_group.addButton(self.compile_pill)
         pill_group.addButton(self.silence_pill)
+        pill_group.addButton(self.transcribe_pill)
 
         layout.addWidget(self.compile_pill)
         layout.addSpacing(4)
         layout.addWidget(self.silence_pill)
+        layout.addSpacing(4)
+        layout.addWidget(self.transcribe_pill)
 
         layout.addStretch()
 
@@ -681,6 +697,7 @@ class MainWindow(QMainWindow):
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self._create_compiler_page())
         self.content_stack.addWidget(self._create_silence_page())
+        self.content_stack.addWidget(self._create_transcribe_page())
         scroll_layout.addWidget(self.content_stack)
 
         scroll_layout.addWidget(self._create_shared_output_card())
@@ -973,6 +990,99 @@ class MainWindow(QMainWindow):
         self.silence_button.clicked.connect(self._on_silence_clicked)
         self.silence_button.setStyleSheet(self._primary_button_qss())
         layout.addWidget(self.silence_button)
+
+        return widget
+
+    def _create_transcribe_page(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        title = self._create_mode_title(
+            "Transcribe",
+            "Turn any media file into SRT + TXT subtitles with accurate timing.",
+        )
+        layout.addWidget(title)
+
+        source_card, source_layout = self._create_card("Select Media")
+
+        self.transcribe_drop_zone = DropZone()
+        self.transcribe_drop_zone.file_dropped.connect(
+            self._on_transcribe_file_dropped
+        )
+        self.transcribe_drop_zone.select_button.clicked.connect(
+            self._browse_transcribe_file
+        )
+        source_layout.addWidget(self.transcribe_drop_zone)
+
+        file_row = QWidget()
+        file_layout = QHBoxLayout(file_row)
+        file_layout.setContentsMargins(0, 0, 0, 0)
+        file_layout.setSpacing(8)
+
+        file_label = QLabel("Selected File")
+        file_label.setObjectName("field-label")
+        file_label.setFixedWidth(90)
+        self.transcribe_file_edit = QLineEdit()
+        self.transcribe_file_edit.setReadOnly(True)
+        self.transcribe_file_edit.setPlaceholderText("No media file selected...")
+        file_browse = QPushButton("Browse...")
+        file_browse.setObjectName("secondary-button")
+        file_browse.setFixedWidth(90)
+        file_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        file_browse.clicked.connect(self._browse_transcribe_file)
+
+        file_layout.addWidget(file_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        file_layout.addWidget(self.transcribe_file_edit, stretch=1)
+        file_layout.addWidget(file_browse)
+        source_layout.addWidget(file_row)
+
+        layout.addWidget(source_card)
+
+        options_card, options_layout = self._create_card("Transcription Options")
+        grid = QGridLayout()
+        grid.setVerticalSpacing(12)
+        grid.setHorizontalSpacing(10)
+
+        model_label = QLabel("Whisper Model")
+        model_label.setObjectName("field-label")
+        model_label.setFixedWidth(160)
+        self.transcribe_model_combo = NoWheelComboBox()
+        self.transcribe_model_combo.addItems(["tiny", "base", "small", "medium"])
+        self.transcribe_model_combo.setCurrentIndex(2)
+        self.transcribe_model_combo.setFixedWidth(260)
+        self.transcribe_model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lang_label = QLabel("Language")
+        lang_label.setObjectName("field-label")
+        lang_label.setFixedWidth(160)
+        self.transcribe_lang_combo = NoWheelComboBox()
+        self.transcribe_lang_combo.addItems(list(SUPPORTED_LANGUAGES.keys()))
+        self.transcribe_lang_combo.setFixedWidth(260)
+        self.transcribe_lang_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        hint = QLabel(
+            "Model & language are shared with Silence Removal. "
+            "Outputs land in the shared Output Folder."
+        )
+        hint.setObjectName("hint-label")
+        hint.setWordWrap(True)
+
+        grid.addWidget(model_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.transcribe_model_combo, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(lang_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.transcribe_lang_combo, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        options_layout.addLayout(grid)
+        options_layout.addWidget(hint)
+        layout.addWidget(options_card)
+
+        self.transcribe_button = QPushButton("Generate Subtitles")
+        self.transcribe_button.setMinimumHeight(44)
+        self.transcribe_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.transcribe_button.clicked.connect(self._on_transcribe_clicked)
+        self.transcribe_button.setStyleSheet(self._primary_button_qss())
+        layout.addWidget(self.transcribe_button)
 
         return widget
 
@@ -1553,7 +1663,20 @@ class MainWindow(QMainWindow):
         self.scene_check.toggled.connect(lambda _: self._save_settings())
         self.fade_check.toggled.connect(lambda _: self._save_settings())
         self.subtitle_model_combo.currentTextChanged.connect(
-            lambda _: self._on_subtitle_model_changed()
+            lambda _: self._on_whisper_pref_changed(
+                self.subtitle_model_combo, self.transcribe_model_combo)
+        )
+        self.subtitle_lang_combo.currentTextChanged.connect(
+            lambda _: self._on_whisper_pref_changed(
+                self.subtitle_lang_combo, self.transcribe_lang_combo)
+        )
+        self.transcribe_model_combo.currentTextChanged.connect(
+            lambda _: self._on_whisper_pref_changed(
+                self.transcribe_model_combo, self.subtitle_model_combo)
+        )
+        self.transcribe_lang_combo.currentTextChanged.connect(
+            lambda _: self._on_whisper_pref_changed(
+                self.transcribe_lang_combo, self.subtitle_lang_combo)
         )
         self.threshold_spin.valueChanged.connect(lambda _: self._save_settings())
         self.min_duration_spin.valueChanged.connect(lambda _: self._save_settings())
@@ -1563,6 +1686,9 @@ class MainWindow(QMainWindow):
         self.silence_file_edit.textChanged.connect(
             lambda _: self._on_silence_file_text_changed()
         )
+        self.transcribe_file_edit.textChanged.connect(
+            lambda _: self._update_output_preview()
+        )
 
     def _on_encoder_changed(self) -> None:
         text = self.encoder_combo.currentText().lower()
@@ -1571,11 +1697,16 @@ class MainWindow(QMainWindow):
         if not self._loading:
             self._save_settings()
 
-    def _on_subtitle_model_changed(self) -> None:
-        if self._loading:
-            return
-        self._save_settings()
+    def _on_whisper_pref_changed(self, changed, mirror) -> None:
+        """Keep model/language combos in sync across both modes."""
+        value = changed.currentText()
+        if mirror.currentText() != value:
+            mirror.blockSignals(True)
+            mirror.setCurrentText(value)
+            mirror.blockSignals(False)
         self._refresh_subtitle_model_status()
+        if not self._loading:
+            self._save_settings()
 
     def _on_noise_toggled(self, checked: bool) -> None:
         self._set_noise_controls_visible(checked)
@@ -1749,14 +1880,22 @@ class MainWindow(QMainWindow):
             self.noise_strength_combo.setCurrentIndex(strength_index)
 
         self.subtitle_check.setChecked(settings.value("subtitle_enabled", False, type=bool))
-        sub_model = settings.value("subtitle_model", "small", type=str)
-        sub_model_index = self.subtitle_model_combo.findText(sub_model)
+        whisper_model = (
+            settings.value("whisper_model", "", type=str)
+            or settings.value("subtitle_model", "", type=str)
+        )
+        sub_model_index = self.subtitle_model_combo.findText(whisper_model)
         if sub_model_index >= 0:
             self.subtitle_model_combo.setCurrentIndex(sub_model_index)
-        sub_lang = settings.value("subtitle_language", "Auto-detect", type=str)
-        sub_lang_index = self.subtitle_lang_combo.findText(sub_lang)
+            self.transcribe_model_combo.setCurrentIndex(sub_model_index)
+        whisper_lang = (
+            settings.value("whisper_language", "", type=str)
+            or settings.value("subtitle_language", "Auto-detect", type=str)
+        )
+        sub_lang_index = self.subtitle_lang_combo.findText(whisper_lang)
         if sub_lang_index >= 0:
             self.subtitle_lang_combo.setCurrentIndex(sub_lang_index)
+            self.transcribe_lang_combo.setCurrentIndex(sub_lang_index)
 
         last_media = settings.value("last_media_file", "", type=str)
         if last_media and Path(last_media).exists():
@@ -1782,9 +1921,9 @@ class MainWindow(QMainWindow):
         settings.setValue("noise_enabled", self.noise_check.isChecked())
         settings.setValue("noise_mode", self.noise_mode_combo.currentText())
         settings.setValue("noise_strength", self.noise_strength_combo.currentText())
+        settings.setValue("whisper_model", self.subtitle_model_combo.currentText())
+        settings.setValue("whisper_language", self.subtitle_lang_combo.currentText())
         settings.setValue("subtitle_enabled", self.subtitle_check.isChecked())
-        settings.setValue("subtitle_model", self.subtitle_model_combo.currentText())
-        settings.setValue("subtitle_language", self.subtitle_lang_combo.currentText())
         settings.setValue("last_media_file", self.silence_file_edit.text().strip())
         settings.sync()
 
@@ -1868,8 +2007,21 @@ class MainWindow(QMainWindow):
             return
 
         stamp = make_timestamp()
-        if self.content_stack.currentIndex() == 0:
+        index = self.content_stack.currentIndex()
+
+        if index == 0:
             name = f"{compiler_output_name(stamp)}.mp4"
+            self.preview_label.setText(f"Output: {os.path.join(output_folder, name)}")
+            return
+
+        if index == 2:
+            media_path = self.transcribe_file_edit.text().strip()
+            if not media_path:
+                self.preview_label.setText(
+                    "Select a media file to preview the result path."
+                )
+                return
+            name = Path(media_path).stem + ".srt"
             self.preview_label.setText(f"Output: {os.path.join(output_folder, name)}")
             return
 
@@ -1898,6 +2050,11 @@ class MainWindow(QMainWindow):
 
     def _show_silence_mode(self) -> None:
         self.content_stack.setCurrentIndex(1)
+        self._restore_status_label()
+        self._update_output_preview()
+
+    def _show_transcribe_mode(self) -> None:
+        self.content_stack.setCurrentIndex(2)
         self._restore_status_label()
         self._update_output_preview()
 
@@ -2067,6 +2224,49 @@ class MainWindow(QMainWindow):
             min_duration, padding, denoise_config, subtitle_config,
         )
 
+    def _on_transcribe_file_dropped(self, file_path: str) -> None:
+        self.transcribe_file_edit.setText(file_path)
+        self.append_log(f"Transcribe file dropped: {file_path}")
+
+    def _browse_transcribe_file(self) -> None:
+        start_dir = self.transcribe_file_edit.text() or str(Path.home())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Media File", start_dir, MEDIA_FILTER
+        )
+        if file_path:
+            self.transcribe_file_edit.setText(file_path)
+            self.append_log(f"Transcribe file selected: {file_path}")
+
+    def _on_transcribe_clicked(self) -> None:
+        file_path = self.transcribe_file_edit.text().strip()
+        if not file_path:
+            QMessageBox.warning(
+                self, "Missing Media File",
+                "Please drop or browse for a media file.",
+            )
+            return
+        if not Path(file_path).exists():
+            QMessageBox.warning(
+                self, "Invalid Media File",
+                f"The selected file does not exist:\n{file_path}",
+            )
+            return
+
+        output_folder = self._validated_output_folder()
+        if output_folder is None:
+            return
+
+        model_size = self.transcribe_model_combo.currentText()
+        language = self.transcribe_lang_combo.currentText()
+
+        self.transcribe_button.setEnabled(False)
+        self.transcribe_button.setText("Transcribing...")
+        self.append_log("Starting transcription...")
+
+        self.transcribe_requested.emit(
+            file_path, output_folder, model_size, language
+        )
+
     def _on_cancel_clicked(self) -> None:
         self.cancel_button.setText("Cancelling...")
         self.cancel_button.setEnabled(False)
@@ -2101,15 +2301,22 @@ class MainWindow(QMainWindow):
             self.compile_button.setEnabled(True)
             self.compile_button.setText(self.PLAN_BUTTON_TEXT)
 
+        if kind != "transcribe":
+            self.transcribe_button.setEnabled(True)
+            self.transcribe_button.setText("Generate Subtitles")
+
     def end_job(self) -> None:
         """Reset all job visuals back to idle."""
         self._busy_owner = None
         self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
         self.cancel_button.setVisible(False)
         self.cancel_button.setEnabled(True)
         self.cancel_button.setText("Cancel")
         self.compile_button.setEnabled(True)
         self.compile_button.setText(self.PLAN_BUTTON_TEXT)
+        self.transcribe_button.setEnabled(True)
+        self.transcribe_button.setText("Generate Subtitles")
         self._restore_status_label()
 
     def update_queue_count(self, count: int) -> None:

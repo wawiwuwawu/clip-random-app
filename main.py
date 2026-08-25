@@ -27,6 +27,7 @@ from core.worker import (
     ClipPlanningWorker,
     ClipRenderWorker,
     SilenceRemovalWorker,
+    TranscribeWorker,
 )
 
 
@@ -59,6 +60,7 @@ class Application:
         self.window.silence_removal_requested.connect(
             self._on_silence_removal_requested
         )
+        self.window.transcribe_requested.connect(self._on_transcribe_requested)
         self.window.cancellation_requested.connect(self._on_cancellation_requested)
         self.window.ffmpeg_override_changed.connect(self._on_ffmpeg_override_changed)
 
@@ -199,6 +201,22 @@ class Application:
                 padding=padding,
                 denoise=denoise or {},
                 subtitle=subtitle or {},
+            )
+        )
+
+    def _on_transcribe_requested(
+        self,
+        media_path: str,
+        output_folder: str,
+        model_size: str,
+        language: str,
+    ) -> None:
+        self._submit(
+            TranscribeWorker(
+                media_path=media_path,
+                output_folder=output_folder,
+                model_size=model_size,
+                language=language,
             )
         )
 
