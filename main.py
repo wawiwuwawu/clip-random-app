@@ -158,6 +158,7 @@ class Application:
         portrait: bool,
         scene_cut: bool,
         crossfade: float,
+        cut_gpu: bool,
     ) -> None:
         self._submit(
             ClipPlanningWorker(
@@ -169,6 +170,7 @@ class Application:
                 portrait=portrait,
                 scene_cut=scene_cut,
                 crossfade=crossfade,
+                cut_gpu=cut_gpu,
             )
         )
 

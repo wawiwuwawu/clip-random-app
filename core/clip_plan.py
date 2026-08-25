@@ -35,6 +35,7 @@ class ClipSession:
     encoder: str = ""
     output_folder: str = ""
     crossfade: float = 0.0
+    cut_gpu: bool = False
     # Re-roll support: video path -> candidate (start, end) pairs
     candidates_by_video: dict[str, list[tuple[float, float]]] = field(
         default_factory=dict

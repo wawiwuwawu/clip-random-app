@@ -44,6 +44,7 @@ from core.ffmpeg_engine import (
     silence_output_name,
 )
 from core import history
+from core.version import APP_VERSION
 from core import subtitles as subtitles_mod
 from core.subtitles import (
     SUPPORTED_LANGUAGES,
@@ -512,6 +513,7 @@ class MainWindow(QMainWindow):
     aspect_combo: NoWheelComboBox
     scene_check: QPushButton
     fade_check: QPushButton
+    gpu_cut_check: QPushButton
     encoder_combo: NoWheelComboBox
     encoder_warning: QLabel
     detected_label: QLabel
@@ -542,7 +544,7 @@ class MainWindow(QMainWindow):
     log_console: QPlainTextEdit
 
     # Public signals
-    plan_requested = Signal(list, str, int, int, str, bool, bool, float)
+    plan_requested = Signal(list, str, int, int, str, bool, bool, float, bool)
     render_requested = Signal(object)
     discard_session_requested = Signal(object)
     silence_removal_requested = Signal(str, str, str, int, float, float, dict, dict)
@@ -555,7 +557,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        self.setWindowTitle("Smart Video Compiler")
+        self.setWindowTitle(f"Smart Video Compiler v{APP_VERSION}")
         self.setMinimumSize(780, 550)
         self.resize(960, 700)
 
@@ -775,6 +777,16 @@ class MainWindow(QMainWindow):
             "Off = hard cut (default). On = 0.5s crossfade between clips."
         )
 
+        self.gpu_cut_check = QPushButton("GPU cutting (faster)")
+        self.gpu_cut_check.setObjectName("check-pill")
+        self.gpu_cut_check.setCheckable(True)
+        self.gpu_cut_check.setChecked(True)
+        self.gpu_cut_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.gpu_cut_check.setToolTip(
+            "Cut clips with NVIDIA NVENC when available "
+            "(automatic CPU fallback per clip)."
+        )
+
         settings_grid.addWidget(total_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         settings_grid.addWidget(self.total_duration_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(clip_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -783,6 +795,7 @@ class MainWindow(QMainWindow):
         settings_grid.addWidget(self.aspect_combo, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(self.scene_check, options_grid_row, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_grid.addWidget(self.fade_check, options_grid_row + 1, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
+        settings_grid.addWidget(self.gpu_cut_check, options_grid_row + 2, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
         settings_layout.addLayout(settings_grid)
         layout.addWidget(settings_card)
 
@@ -1662,6 +1675,7 @@ class MainWindow(QMainWindow):
         self.aspect_combo.currentTextChanged.connect(lambda _: self._save_settings())
         self.scene_check.toggled.connect(lambda _: self._save_settings())
         self.fade_check.toggled.connect(lambda _: self._save_settings())
+        self.gpu_cut_check.toggled.connect(lambda _: self._save_settings())
         self.subtitle_model_combo.currentTextChanged.connect(
             lambda _: self._on_whisper_pref_changed(
                 self.subtitle_model_combo, self.transcribe_model_combo)
@@ -1859,6 +1873,7 @@ class MainWindow(QMainWindow):
 
         self.scene_check.setChecked(settings.value("scene_cut", False, type=bool))
         self.fade_check.setChecked(settings.value("crossfade", False, type=bool))
+        self.gpu_cut_check.setChecked(settings.value("cut_gpu", True, type=bool))
 
         encoder_choice = settings.value("encoder_choice", "", type=str)
         index = self.encoder_combo.findText(encoder_choice)
@@ -1914,6 +1929,7 @@ class MainWindow(QMainWindow):
         settings.setValue("aspect_choice", self.aspect_combo.currentText())
         settings.setValue("scene_cut", self.scene_check.isChecked())
         settings.setValue("crossfade", self.fade_check.isChecked())
+        settings.setValue("cut_gpu", self.gpu_cut_check.isChecked())
         settings.setValue("encoder_choice", self.encoder_combo.currentText())
         settings.setValue("threshold_db", self.threshold_spin.value())
         settings.setValue("min_duration", self.min_duration_spin.value())
@@ -1963,6 +1979,9 @@ class MainWindow(QMainWindow):
         self._update_detected_label()
         if key == "cpu":
             self.append_log("Startup detection: no usable GPU encoder found.")
+            if hasattr(self, "gpu_cut_check"):
+                self.gpu_cut_check.setEnabled(False)
+                self.gpu_cut_check.setToolTip("No usable GPU encoder detected.")
         else:
             self.append_log(f"Startup detection: {GPU_DISPLAY_BY_KEY[key]} available.")
 
@@ -2165,6 +2184,7 @@ class MainWindow(QMainWindow):
         portrait = self.aspect_combo.currentIndex() == 1
         scene_cut = self.scene_check.isChecked()
         crossfade = 0.5 if self.fade_check.isChecked() else 0.0
+        cut_gpu = self.gpu_cut_check.isEnabled() and self.gpu_cut_check.isChecked()
 
         self.compile_button.setEnabled(False)
         self.compile_button.setText("Planning...")
@@ -2172,7 +2192,7 @@ class MainWindow(QMainWindow):
 
         self.plan_requested.emit(
             sources, output_folder, total_dur_seconds, clip_dur,
-            encoder, portrait, scene_cut, crossfade,
+            encoder, portrait, scene_cut, crossfade, cut_gpu,
         )
 
     def _on_silence_clicked(self) -> None:
@@ -2398,6 +2418,7 @@ class MainWindow(QMainWindow):
 
         engine = FFmpegEngine()
         help_text = (
+            f"<h3>Smart Video Compiler v{APP_VERSION}</h3>"
             "<h3>Clip Compiler</h3>"
             "<p>Add single video files and/or entire folders, then click "
             "<b>Plan Clips</b>. Review the planned clips (exclude / re-roll "

@@ -569,29 +569,26 @@ class FFmpegEngine:
         start: float,
         duration: float,
         output_path: str,
+        encoder: str = "cpu",
     ) -> bool:
         """
         Extract a single clip from *video_path* using re-encode with a
         guaranteed keyframe at frame 0 for clean concatenation.
 
-        Parameters
-        ----------
-        video_path : str
-            Source video.
-        start : float
-            Seek position in seconds.
-        duration : float
-            Clip length in seconds.
-        output_path : str
-            Destination path for the extracted clip.
-
-        Returns
-        -------
-        bool
-            ``True`` on success, ``False`` on failure.
+        ``encoder="nvenc"`` cuts with hardware h264_nvenc (p1 / low-latency)
+        and returns False so callers can fall back to CPU per clip.
         """
         # Ensure the output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        cut_encoder_map = {
+            "cpu": ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"],
+            "nvenc": [
+                "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
+                "-rc", "vbr", "-cq", "26",
+            ],
+        }
+        video_args = cut_encoder_map.get(encoder, cut_encoder_map["cpu"])
 
         cmd = [
             self._ffmpeg_bin("ffmpeg"),
@@ -600,9 +597,7 @@ class FFmpegEngine:
             "-ss", f"{start:.3f}",
             "-i", video_path,
             "-t", f"{duration:.3f}",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
+            *video_args,
             "-force_key_frames", "expr:eq(n,0)",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
@@ -611,17 +606,18 @@ class FFmpegEngine:
             output_path,
         ]
         cmd_str = " ".join(str(c) for c in cmd)
-        self._log(f"Cutting clip: {cmd_str}")
+        self._log(f"Cutting clip ({encoder}): {cmd_str}")
 
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
-            # Verify output file is not truncated
-            if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
-                self._log(f"Clip \"{output_path}\" was truncated (size < 1 KB)")
-                return False
-            return True
         except subprocess.CalledProcessError as exc:
-            self._log(f"Failed to cut clip \"{output_path}\": {exc}")
+            if encoder == "nvenc":
+                self._log(
+                    f"NVENC cut failed (exit {exc.returncode}) — "
+                    "falling back to CPU for this clip."
+                )
+            else:
+                self._log(f"Failed to cut clip \"{output_path}\": {exc}")
             if exc.stderr:
                 stderr_lines = exc.stderr.strip().split("\n")
                 tail = stderr_lines[-min(10, len(stderr_lines)):]
@@ -630,6 +626,12 @@ class FFmpegEngine:
         except FileNotFoundError:
             self._log("ffmpeg binary not found on PATH")
             return False
+
+        # Verify output file is not truncated
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) < 1024:
+            self._log(f"Clip \"{output_path}\" was truncated (size < 1 KB)")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     def concat_clips(

@@ -55,6 +55,7 @@ class ClipPlanningWorker(QThread):
         portrait: bool = False,
         scene_cut: bool = False,
         crossfade: float = 0.0,
+        cut_gpu: bool = False,
         parent: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
@@ -66,6 +67,7 @@ class ClipPlanningWorker(QThread):
         self.portrait = portrait
         self.scene_cut = scene_cut
         self.crossfade = crossfade
+        self.cut_gpu = cut_gpu
 
         self.engine = FFmpegEngine()
         self.engine.log_callback = self.log_message.emit
@@ -220,6 +222,7 @@ class ClipPlanningWorker(QThread):
             encoder=self.encoder,
             output_folder=self.output_folder,
             crossfade=self.crossfade,
+            cut_gpu=self.cut_gpu,
         )
         session.candidates_by_video = candidates_by_video
 
@@ -319,6 +322,7 @@ class ClipRenderWorker(QThread):
         durations: list[float] = []
         renumbered: dict[int, str] = {}
         render_index = 0
+        cut_encoder = "nvenc" if self.session.cut_gpu else "cpu"
 
         for idx, clip in enumerate(clips):
             if self.isInterruptionRequested():
@@ -348,14 +352,24 @@ class ClipRenderWorker(QThread):
                 start=clip.start,
                 duration=clip.duration,
                 output_path=new_output,
+                encoder=cut_encoder,
             )
+            if not success and cut_encoder == "nvenc":
+                # Stop hammering a broken GPU session — retry this clip on
+                # CPU and keep the rest on CPU too.
+                cut_encoder = "cpu"
+                self.log_message.emit("Retrying this clip on CPU; "
+                                      "remaining clips will use CPU.")
+                success = self.engine.cut_clip(
+                    video_path=clip.video,
+                    start=clip.start,
+                    duration=clip.duration,
+                    output_path=new_output,
+                    encoder="cpu",
+                )
             if success:
                 extracted.append(new_output)
                 durations.append(clip.duration)
-            else:
-                self.log_message.emit(
-                    f"Warning: failed to extract clip [{render_index}/{len(clips)}], skipping."
-                )
 
             progress = int((idx + 1) / len(clips) * 70)
             self.progress_percent.emit(progress)
