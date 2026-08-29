@@ -97,15 +97,22 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def _purge_model_cache(model_size: str) -> None:
+    """Safely remove corrupted HF cache directory for a given model size."""
+    import shutil
+    cache_root = Path(os.environ.get("HF_HOME", "")) / "hub"
+    folder_name = f"models--{_MODEL_REPO_PREFIX.replace('/', '--')}{model_size}"
+    target = cache_root / folder_name
+    if target.exists():
+        try:
+            shutil.rmtree(target, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def is_model_cached(model_size: str) -> bool:
     """True when the HF snapshot already exists locally (or is bundled)."""
-    if resolve_bundled_model(model_size):
-        return True
-    try:
-        from huggingface_hub import snapshot_exists
-        return snapshot_exists(_MODEL_REPO_PREFIX + model_size)
-    except Exception:
-        return False
+    return _model_cached(model_size)
 
 
 def download_model(
@@ -144,7 +151,6 @@ def _load_model(
     cancel_check=None,
 ) -> object:
     from core.cuda_setup import ensure_cuda_libs
-
     from faster_whisper import WhisperModel
 
     log = log or (lambda msg: None)
@@ -154,11 +160,24 @@ def _load_model(
     bundled = resolve_bundled_model(model_size)
     source = bundled or (_MODEL_REPO_PREFIX + model_size)
 
+    def _instantiate(dev: str, comp: str) -> object:
+        try:
+            return WhisperModel(source, device=dev, compute_type=comp)
+        except Exception as exc:
+            err_str = str(exc)
+            if not bundled and ("model.bin" in err_str or "Unable to open" in err_str or "corrupted" in err_str.lower()):
+                log(f"Corrupted model cache for \"{model_size}\" detected — purging and re-downloading...")
+                _purge_model_cache(model_size)
+                status_cb(f"Downloading Whisper model \"{model_size}\"...")
+                download_model(model_size, progress_cb=dl_progress_cb, cancel_check=cancel_check)
+                return WhisperModel(source, device=dev, compute_type=comp)
+            raise
+
     status_cb("Checking CUDA libraries...")
     if ensure_cuda_libs(log_cb=log, progress_cb=dl_progress_cb,
                         cancel_check=cancel_check):
         try:
-            model = WhisperModel(source, device="cuda", compute_type="float16")
+            model = _instantiate("cuda", "float16")
             origin = "bundled" if bundled else "cache"
             log(f"Whisper backend: CUDA float16 "
                 f"(model={model_size}, {origin})")
@@ -184,16 +203,23 @@ def _load_model(
     else:
         status_cb("Loading speech model...")
 
-    model = WhisperModel(source, device="cpu", compute_type="int8")
+    model = _instantiate("cpu", "int8")
     log(f"Whisper backend: CPU int8 (model={model_size})")
     return model
 
 
 def _model_cached(model_size: str) -> bool:
-    """True when the HF snapshot for this model already exists locally."""
+    """True when the HF snapshot for this model exists AND contains valid model.bin."""
+    if resolve_bundled_model(model_size):
+        return True
     try:
-        from huggingface_hub import snapshot_exists
-        return snapshot_exists(_MODEL_REPO_PREFIX + model_size)
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(
+            _MODEL_REPO_PREFIX + model_size,
+            local_files_only=True,
+        )
+        model_file = Path(path) / "model.bin"
+        return model_file.is_file() and model_file.stat().st_size > 0
     except Exception:
         return False
 
