@@ -66,8 +66,8 @@ NOISE_MODEL_FILENAME = "mp.rnnn"
 
 
 def escape_filter_path(path: str) -> str:
-    """Make a Windows path safe inside an FFmpeg filtergraph option value."""
-    return path.replace("\\", "/").replace(":", "\\:")
+    """Make a Windows path safe inside an FFmpeg filtergraph option value when enclosed in single quotes."""
+    return path.replace("\\", "/").replace("'", "\\'")
 
 
 def resolve_noise_model_path(name: str = NOISE_MODEL_FILENAME) -> str:
