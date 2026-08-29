@@ -112,6 +112,10 @@ def build_noise_filters(
 
     if (mode or "").lower() == "ai":
         model = resolve_noise_model_path()
+        if not os.path.isfile(model):
+            # Bundled RNNoise model missing (e.g. incomplete install) — skip
+            # AI denoise rather than emitting an invalid filter FFmpeg rejects.
+            return []
         escaped = escape_filter_path(model)
         mix_map = {"light": "0.7", "medium": "1.0", "strong": "1.0"}
         mix = mix_map.get(s, "1.0")
@@ -904,7 +908,10 @@ class FFmpegEngine:
             subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
             return True
         except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
             self._log(f"Audio concatenation failed: {exc}")
+            if detail:
+                self._log(detail.splitlines()[-1] if detail.splitlines() else detail)
             return False
         except FileNotFoundError:
             self._log("ffmpeg binary not found on PATH")

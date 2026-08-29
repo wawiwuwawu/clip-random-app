@@ -1,27 +1,68 @@
 # Smart Video Compiler
 
-Aplikasi desktop Windows (PySide6 + FFmpeg) untuk:
+Aplikasi desktop Windows ringan untuk mengolah video & audio secara otomatis.
+Dibangun dengan PySide6 (Qt6) dan FFmpeg — gratis dan open source (MIT).
 
-- **Clip Compiler** — pilih folder/file video, app mengambil klip acak
-  terbaik lalu menyatukannya menjadi satu video (preview + re-roll per
-  klip, mode portrait 9:16, transisi fade opsional).
-- **Silence Removal** — buang bagian hening dari satu file video/audio,
-  lengkap dengan **penghilang noise** (FFT auto-kalibrasi / AI RNNoise)
-  dan **auto-subtitle .srt**.
-- **Transcribe** — media apa pun langsung jadi `.srt` + `.txt`.
+## Fitur Utama
 
-Encoding memakai NVENC / QSV / AMF otomatis dengan fallback CPU.
-Subtitle dijalankan oleh [faster-whisper](https://github.com/SYSTRAN/faster-whisper);
-model `tiny` sudah ikut dalam installer, model lain terunduh otomatis.
+- **Clip Compiler** — pilih folder/file video, aplikasi mengambil klip acak
+  terbaik lalu menyatukannya menjadi satu video utuh. Tersedia preview per klip
+  dengan opsi *exclude* / *re-roll*, mode portrait 9:16, serta transisi fade
+  opsional.
+- **Silence Removal** — buang bagian hening dari satu file video/audio.
+  Dilengkapi **penghilang noise** (AI RNNoise atau FFT auto-kalibrasi) dan
+  pembuatan **subtitle .srt** otomatis.
+- **Transcribe** — ubah audio/video apa pun menjadi teks **.srt** + **.txt**
+  menggunakan [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
-## Requirements
+Encoding video memakai akselerasi hardware (NVENC / QSV / AMF) secara otomatis
+dengan fallback ke CPU bila diperlukan. Model Whisper `tiny` sudah dibundel
+di dalam installer; model yang lebih besar akan diunduh sekali pada pemakaian
+pertama.
 
-- Windows 10/11 64-bit
-- Python 3.11+ (untuk mode dev)
-- FFmpeg & FFprobe di PATH (untuk dev; installer membawa miliknya sendiri)
-- GPU NVIDIA opsional (NVENC) — tanpa GPU pun tetap jalan via CPU
+## Persyaratan
 
-## Menjalankan dari source (dev)
+- Windows 10 / 11 64-bit
+- Tidak butuh Python atau FFmpeg terpisah — keduanya sudah termasuk dalam installer.
+- GPU NVIDIA opsional (lebih cepat); tanpa GPU tetap berjalan via CPU.
+
+## Cara Mendapatkan & Memasang
+
+1. Buka halaman [Releases](https://github.com/wawiwuwawu/clip-random-app/releases)
+   di GitHub.
+2. Unduh **`SmartVideoCompiler_Setup.exe`** (atau `SmartVideoCompiler_Portable.zip`
+   bila Anda lebih suka versi portable yang cukup diekstrak dan dijalankan).
+3. Jalankan installer dan ikuti petunjuknya. Selesai.
+
+### Memperbarui ke versi terbaru
+
+Cukup jalankan installer versi terbaru. Installer akan memperbarui aplikasi di
+tempatnya (in-place) — **tidak perlu uninstall manual**. Pengaturan Anda serta
+model Whisper yang sudah diunduh tersimpan di folder data aplikasi
+(`%LOCALAPPDATA%\SmartVideoCompiler`) dan akan tetap ada setelah pembaruan.
+
+> Tips: jika setelah memperbarui Anda mendapati perilaku aneh (misal fitur
+> tertentu gagal), uninstall aplikasi lewat *Settings → Apps*, pastikan folder
+> `C:\Program Files\Smart Video Compiler\` sudah terhapus, lalu pasang ulang
+> installer terbaru. Cara ini menjamin semua file internal benar-benar segar.
+
+Jika subtitle gagal diunduh karena cache rusak, hapus folder
+`%LOCALAPPDATA%\SmartVideoCompiler\hf` lalu coba lagi — aplikasi akan
+mengunduh ulang secara otomatis.
+
+## Cara Menggunakan (Singkat)
+
+1. **Clip Compiler** — tambahkan sumber video, atur durasi klip & total, lalu
+   *Plan*. Tinjau hasil di dialog preview, lalu *Render*.
+2. **Silence Removal** — pilih satu file video/audio, atur ambang hening &
+   opsi denoise, lalu mulai. Hasil `_cleaned_*` akan muncul di folder output.
+3. **Transcribe** — pilih file media, pilih model & bahasa, lalu mulai. Teks
+   `.srt`/`.txt` akan disimpan di sebelah file asal.
+
+Semua proses berjalan dalam antrean; Anda dapat memantau progres dan log langsung
+di jendela aplikasi.
+
+## Build dari Source (untuk pengembang)
 
 ```bash
 git clone https://github.com/wawiwuwawu/clip-random-app.git
@@ -30,33 +71,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
-FFmpeg cepat dipasang via WinGet: `winget install Gyan.FFmpeg`.
-
-## Build installer
-
-Cara termudah — satu script (butuh [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
+Untuk membangun installer secara lokal (membutuhkan [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
 
 ```powershell
 .\build_local.ps1
-```
-
-Hasil: `SmartVideoCompiler_Setup.exe` di root proyek.
-
-Atau manual:
-
-```bash
-pyinstaller SmartVideoCompiler.spec --noconfirm
-ISCC.exe SmartVideoCompiler.iss
-```
-
-### Releases otomatis
-
-Push tag → GitHub Actions membangun installer dan menempelkannya ke
-halaman [Releases](https://github.com/wawiwuwawu/clip-random-app/releases):
-
-```bash
-git tag v1.0.0
-git push --tags
 ```
 
 ## Struktur Proyek
@@ -76,6 +94,6 @@ ui/
 assets/models/           RNNoise denoise model + Whisper tiny (bundel)
 ```
 
-## License
+## Lisensi
 
 [MIT](LICENSE) — © 2026 wawiwuwawu (wawunime)

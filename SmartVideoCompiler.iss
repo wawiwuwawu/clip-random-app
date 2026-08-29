@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "Smart Video Compiler"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.2"
 #define MyAppPublisher "wawunime"
 #define MyAppURL "https://web.wawunime.my.id/"
 #define MyAppExeName "SmartVideoCompiler.exe"
@@ -48,6 +48,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "dist\SmartVideoCompiler\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\SmartVideoCompiler\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[InstallDelete]
+; Wipe the old PyInstaller onedir folder on upgrade so a stale/mixed
+; _internal (e.g. a locked ffmpeg.exe) can never break the new build.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [UninstallDelete]
 ; Remove downloaded models / CUDA runtime / history on uninstall

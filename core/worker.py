@@ -756,11 +756,12 @@ class SilenceRemovalWorker(QThread):
         self.progress_percent.emit(62)
 
         audio_filters = None
+        denoise_mode = None
         if self.denoise.get("enabled"):
-            mode = self.denoise.get("mode", "fft")
+            denoise_mode = self.denoise.get("mode", "fft")
             strength = self.denoise.get("strength", "medium")
             noise_floor = None
-            if mode != "ai":
+            if denoise_mode != "ai":
                 noise_floor = self.engine.measure_noise_floor(
                     self.video_path, segments
                 )
@@ -775,10 +776,10 @@ class SilenceRemovalWorker(QThread):
                         "No silent gap long enough to measure \u2014 "
                         "using default denoise preset."
                     )
-            audio_filters = build_noise_filters(mode, strength, noise_floor)
+            audio_filters = build_noise_filters(denoise_mode, strength, noise_floor)
             self.log_message.emit(
-                f"Applying noise removal (mode={mode}"
-                + (f", strength={strength}" if mode != "ai" else "")
+                f"Applying noise removal (mode={denoise_mode}"
+                + (f", strength={strength}" if denoise_mode != "ai" else "")
                 + ")..."
             )
 
@@ -789,19 +790,34 @@ class SilenceRemovalWorker(QThread):
             self._emit_cancelled()
             return
 
-        if audio_only:
-            concat_ok = self.engine.concat_audio_clips(
-                clip_paths=clip_paths,
-                output_path=out_path,
-                audio_filters=audio_filters,
-            )
-        else:
-            concat_ok = self.engine.concat_clips(
+        def _run_concat(filters: list[str] | None) -> bool:
+            if audio_only:
+                return self.engine.concat_audio_clips(
+                    clip_paths=clip_paths,
+                    output_path=out_path,
+                    audio_filters=filters,
+                )
+            return self.engine.concat_clips(
                 clip_paths=clip_paths,
                 output_path=out_path,
                 encoder=map_encoder_display(self.encoder),
-                audio_filters=audio_filters,
+                audio_filters=filters,
             )
+
+        concat_ok = _run_concat(audio_filters)
+        # Robustness: if AI denoise filter failed (e.g. bundled model/ffmpeg
+        # mismatch), fall back to FFT denoise, then to no denoise, so the
+        # silence-removed file is always produced.
+        if not concat_ok and denoise_mode == "ai":
+            self.log_message.emit(
+                "AI denoise failed — retrying with FFT denoise..."
+            )
+            concat_ok = _run_concat(build_noise_filters("fft", "medium", noise_floor))
+        if not concat_ok and audio_filters is not None:
+            self.log_message.emit(
+                "Denoise failed — retrying without noise removal..."
+            )
+            concat_ok = _run_concat(None)
 
         if not concat_ok:
             msg = "Final concatenation / encoding failed."
