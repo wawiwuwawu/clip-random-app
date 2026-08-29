@@ -15,6 +15,25 @@ Every finished/failed job is written to the on-disk history file.
 import os
 import sys
 
+
+class NullStream:
+    """Dummy stream to replace sys.stdout/sys.stderr in PyInstaller GUI builds."""
+
+    def write(self, text: str) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+if sys.stdout is None:
+    sys.stdout = NullStream()
+if sys.stderr is None:
+    sys.stderr = NullStream()
+
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import QApplication

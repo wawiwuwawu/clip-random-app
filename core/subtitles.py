@@ -22,6 +22,7 @@ os.environ.setdefault(
     str(Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")))
         / "SmartVideoCompiler" / "hf"),
 )
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 SUPPORTED_LANGUAGES = {
     "Auto-detect": None,

@@ -190,7 +190,10 @@ class FFmpegEngine:
             full_desc = cmd_str
         # (The engine itself does not log here unless the caller's callback is set)
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
+            return subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", check=True,
+                creationflags=_CREATE_NO_WINDOW,
+            )
         except subprocess.CalledProcessError as exc:
             raise  # let callers handle
 
@@ -250,7 +253,7 @@ class FFmpegEngine:
             self._log("ffmpeg binary not found on PATH — is FFmpeg installed?")
             return []
 
-        stderr = result.stderr  # silencedetect writes to stderr
+        stderr = result.stderr or ""  # silencedetect writes to stderr
 
         # Parse silence_start / silence_end timestamps
         start_pattern = re.compile(r"silence_start:\s*([\d.]+)")
@@ -395,8 +398,11 @@ class FFmpegEngine:
             file_path,
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_CREATE_NO_WINDOW)
-            return result.stdout.strip() == ""
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", check=True,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            return (result.stdout or "").strip() == ""
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
@@ -511,15 +517,16 @@ class FFmpegEngine:
         ]
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=600,
+                cmd, capture_output=True, text=True, errors="replace", timeout=600,
                 creationflags=_CREATE_NO_WINDOW,
             )
         except Exception as exc:
             self._log(f"Scene detection failed for \"{video_path}\": {exc}")
             return []
+        stderr_text = result.stderr or ""
         times = [
             float(m.group(1))
-            for m in re.finditer(r"pts_time:([\d.]+)", result.stderr)
+            for m in re.finditer(r"pts_time:([\d.]+)", stderr_text)
         ]
         return sorted(set(times))
 
@@ -962,10 +969,10 @@ class FFmpegEngine:
         try:
             result = subprocess.run(
                 [binary, "-hide_banner", "-encoders"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, errors="replace", timeout=10,
                 creationflags=_CREATE_NO_WINDOW,
             )
-            listing = (result.stdout + result.stderr).lower()
+            listing = ((result.stdout or "") + (result.stderr or "")).lower()
         except Exception as exc:
             self._log(f"Encoder detection failed ({exc}) — using CPU.")
             return "cpu"
@@ -1055,14 +1062,14 @@ class FFmpegEngine:
         ]
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd, capture_output=True, text=True, errors="replace",
                 creationflags=_CREATE_NO_WINDOW,
             )
         except Exception as exc:
             self._log(f"Noise floor measurement failed: {exc}")
             return None
 
-        for line in result.stderr.splitlines():
+        for line in (result.stderr or "").splitlines():
             if "mean_volume:" in line:
                 try:
                     return float(line.split(":")[1].replace("dB", "").strip())
