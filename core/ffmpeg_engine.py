@@ -1002,12 +1002,18 @@ class FFmpegEngine:
             "-f", "null", "-",
         ]
         try:
-            subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10,
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", timeout=10,
                 creationflags=_CREATE_NO_WINDOW,
             )
-            self._log(f"Probe {codec}: OK")
-            return True
+            if result.returncode == 0:
+                self._log(f"Probe {codec}: OK")
+                return True
+            else:
+                err_lines = (result.stderr or "").strip().splitlines()
+                reason = err_lines[-1] if err_lines else f"exit code {result.returncode}"
+                self._log(f"Probe {codec} failed: {reason}")
+                return False
         except Exception as exc:
             self._log(f"Probe {codec} failed: {exc}")
             return False

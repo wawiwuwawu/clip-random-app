@@ -180,7 +180,7 @@ def _load_model(
         )
         status_cb(msg)
         log(msg)
-        progress_cb(-1)  # busy indicator
+        dl_progress_cb(-1)  # busy indicator
     else:
         status_cb("Loading speech model...")
 

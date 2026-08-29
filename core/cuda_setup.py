@@ -54,7 +54,14 @@ def ensure_cuda_libs(log_cb=None, progress_cb=None, cancel_check=None) -> bool:
     registered (GPU load may still fail for unrelated driver reasons).
     """
     log = log_cb or (lambda msg: None)
-    report = progress_cb or (lambda fraction, label: None)
+
+    def report(fraction: float, label: str = "") -> None:
+        if not progress_cb:
+            return
+        try:
+            progress_cb(fraction, label)
+        except TypeError:
+            progress_cb(fraction)
 
     directory = cuda_bin_dir()
     if _dlls_present(directory):
