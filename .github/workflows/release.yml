@@ -25,6 +25,9 @@ jobs:
       - name: Install build dependencies
         run: pip install PySide6 faster-whisper pyinstaller
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Download FFmpeg (gyan.dev release essentials)
         shell: pwsh
         run: |

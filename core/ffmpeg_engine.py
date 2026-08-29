@@ -66,8 +66,14 @@ NOISE_MODEL_FILENAME = "mp.rnnn"
 
 
 def escape_filter_path(path: str) -> str:
-    """Make a Windows path safe inside an FFmpeg filtergraph option value when enclosed in single quotes."""
-    return path.replace("\\", "/").replace("'", "\\'")
+    """Escape a Windows path for use inside single-quoted FFmpeg filter options.
+
+    FFmpeg's filtergraph parser treats ``:`` as an option separator even inside
+    single quotes, so the drive-letter colon must be escaped as ``\\:``. Backslashes
+    are normalized to forward slashes; spaces are left intact because the caller
+    wraps the value in single quotes.
+    """
+    return path.replace("\\", "/").replace(":", "\\:")
 
 
 def resolve_noise_model_path(name: str = NOISE_MODEL_FILENAME) -> str:
