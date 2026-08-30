@@ -35,6 +35,12 @@ SUPPORTED_LANGUAGES = {
 }
 
 MODEL_SIZES_MB = {"tiny": 75, "base": 145, "small": 461, "medium": 1531}
+MODEL_MIN_BYTES = {
+    "tiny": 25 * 1024 * 1024,      # ~39 MB model.bin
+    "base": 90 * 1024 * 1024,      # ~142 MB model.bin
+    "small": 300 * 1024 * 1024,    # ~466 MB model.bin
+    "medium": 1000 * 1024 * 1024,  # ~1.5 GB model.bin
+}
 _MODEL_REPO_PREFIX = "Systran/faster-whisper-"
 
 
@@ -138,9 +144,20 @@ def download_model(
         return False
 
     progress_cb(-1)
-    path = snapshot_download(repo_id=repo)
+    try:
+        path = snapshot_download(repo_id=repo)
+    except Exception as exc:
+        _purge_model_cache(model_size)
+        raise RuntimeError(f"Gagal mengunduh model Whisper \"{model_size}\": {exc}") from exc
+
     progress_cb(1.0)
-    return bool(path)
+
+    if not _model_cached(model_size):
+        _purge_model_cache(model_size)
+        raise RuntimeError(
+            f"Model Whisper \"{model_size}\" terunduh tetapi file tidak lengkap (model.bin terputus)."
+        )
+    return True
 
 
 def _load_model(
@@ -157,39 +174,8 @@ def _load_model(
     status_cb = status_cb or (lambda msg: None)
     dl_progress_cb = dl_progress_cb or (lambda fraction: None)
 
-    bundled = resolve_bundled_model(model_size)
-    source = bundled or (_MODEL_REPO_PREFIX + model_size)
-
-    def _instantiate(dev: str, comp: str) -> object:
-        try:
-            return WhisperModel(source, device=dev, compute_type=comp)
-        except Exception as exc:
-            err_str = str(exc)
-            if not bundled and ("model.bin" in err_str or "Unable to open" in err_str or "corrupted" in err_str.lower()):
-                log(f"Corrupted model cache for \"{model_size}\" detected — purging and re-downloading...")
-                _purge_model_cache(model_size)
-                status_cb(f"Downloading Whisper model \"{model_size}\"...")
-                download_model(model_size, progress_cb=dl_progress_cb, cancel_check=cancel_check)
-                return WhisperModel(source, device=dev, compute_type=comp)
-            raise
-
-    status_cb("Checking CUDA libraries...")
-    if ensure_cuda_libs(log_cb=log, progress_cb=dl_progress_cb,
-                        cancel_check=cancel_check):
-        try:
-            model = _instantiate("cuda", "float16")
-            origin = "bundled" if bundled else "cache"
-            log(f"Whisper backend: CUDA float16 "
-                f"(model={model_size}, {origin})")
-            return model
-        except Exception as exc:
-            log(f"CUDA load failed ({exc.__class__.__name__}) — using CPU.")
-    else:
-        log("CUDA unavailable — using CPU.")
-
-    if bundled:
-        status_cb("Loading speech model...")
-    elif not _model_cached(model_size):
+    # 1. Ensure model is downloaded & verified 100%
+    if not _model_cached(model_size):
         size_mb = MODEL_SIZES_MB.get(model_size)
         msg = (
             f"Downloading Whisper model \"{model_size}\" "
@@ -199,19 +185,41 @@ def _load_model(
         )
         status_cb(msg)
         log(msg)
-        dl_progress_cb(-1)  # busy indicator
-    else:
-        status_cb("Loading speech model...")
+        download_model(model_size, progress_cb=dl_progress_cb, cancel_check=cancel_check)
 
-    model = _instantiate("cpu", "int8")
+    bundled = resolve_bundled_model(model_size)
+    source = bundled or (_MODEL_REPO_PREFIX + model_size)
+
+    # 2. Try CUDA first if available
+    status_cb("Checking CUDA libraries...")
+    if ensure_cuda_libs(log_cb=log, progress_cb=dl_progress_cb,
+                        cancel_check=cancel_check):
+        try:
+            status_cb("Loading speech model on CUDA...")
+            model = WhisperModel(source, device="cuda", compute_type="float16")
+            origin = "bundled" if bundled else "cache"
+            log(f"Whisper backend: CUDA float16 (model={model_size}, {origin})")
+            return model
+        except Exception as exc:
+            log(f"CUDA load failed ({exc.__class__.__name__}: {exc}) — using CPU fallback.")
+    else:
+        log("CUDA unavailable — using CPU.")
+
+    # 3. CPU Fallback
+    status_cb("Loading speech model on CPU...")
+    model = WhisperModel(source, device="cpu", compute_type="int8")
     log(f"Whisper backend: CPU int8 (model={model_size})")
     return model
 
 
 def _model_cached(model_size: str) -> bool:
     """True when the HF snapshot for this model exists AND contains valid model.bin."""
-    if resolve_bundled_model(model_size):
-        return True
+    bundled = resolve_bundled_model(model_size)
+    if bundled:
+        bin_file = Path(bundled) / "model.bin"
+        if bin_file.is_file() and bin_file.stat().st_size > 1024 * 1024:
+            return True
+
     try:
         from huggingface_hub import snapshot_download
         path = snapshot_download(
@@ -219,7 +227,13 @@ def _model_cached(model_size: str) -> bool:
             local_files_only=True,
         )
         model_file = Path(path) / "model.bin"
-        return model_file.is_file() and model_file.stat().st_size > 0
+        min_bytes = MODEL_MIN_BYTES.get(model_size, 10 * 1024 * 1024)
+        if model_file.is_file() and model_file.stat().st_size >= min_bytes:
+            return True
+
+        # Incomplete or truncated download — purge so fresh download can start
+        _purge_model_cache(model_size)
+        return False
     except Exception:
         return False
 

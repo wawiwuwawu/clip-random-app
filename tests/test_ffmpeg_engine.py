@@ -87,9 +87,10 @@ class TestFFmpegEngine(unittest.TestCase):
 
     def test_build_noise_filters_ai(self) -> None:
         filters = build_noise_filters(mode="ai", strength="strong")
-        self.assertEqual(len(filters), 2)
-        self.assertTrue(filters[0].startswith("arnndn=m='"))
-        self.assertIn("\\:", filters[0])  # colon escaped inside quotes
+        self.assertEqual(len(filters), 3)
+        self.assertEqual(filters[0], "aresample=48000")
+        self.assertTrue(filters[1].startswith("arnndn=m='"))
+        self.assertIn("\\:", filters[1])  # colon escaped inside quotes
 
     def test_build_noise_filters_fft(self) -> None:
         filters = build_noise_filters(mode="fft", strength="medium", noise_floor_db=-35.0)

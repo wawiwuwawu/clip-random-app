@@ -119,7 +119,7 @@ def build_noise_filters(
         escaped = escape_filter_path(model)
         mix_map = {"light": "0.7", "medium": "1.0", "strong": "1.0"}
         mix = mix_map.get(s, "1.0")
-        chain = [f"arnndn=m='{escaped}':mix={mix}"]
+        chain = ["aresample=48000", f"arnndn=m='{escaped}':mix={mix}"]
         if s == "strong":
             chain.append(f"arnndn=m='{escaped}'")
         return chain

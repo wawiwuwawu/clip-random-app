@@ -530,11 +530,15 @@ class MainWindow(QMainWindow):
     subtitle_check: QPushButton
     subtitle_model_combo: NoWheelComboBox
     subtitle_lang_combo: NoWheelComboBox
+    subtitle_status_label: QLabel
+    subtitle_download_button: QPushButton
     transcribe_pill: QPushButton
     transcribe_drop_zone: DropZone
     transcribe_file_edit: QLineEdit
     transcribe_model_combo: NoWheelComboBox
     transcribe_lang_combo: NoWheelComboBox
+    transcribe_status_label: QLabel
+    transcribe_download_button: QPushButton
     transcribe_button: QPushButton
     compile_button: QPushButton
     silence_button: QPushButton
@@ -1067,6 +1071,21 @@ class MainWindow(QMainWindow):
         self.transcribe_model_combo.setFixedWidth(260)
         self.transcribe_model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        t_status_row = QWidget()
+        t_status_layout = QHBoxLayout(t_status_row)
+        t_status_layout.setContentsMargins(0, 0, 0, 0)
+        t_status_layout.setSpacing(10)
+        self.transcribe_status_label = QLabel("")
+        self.transcribe_status_label.setObjectName("hint-label")
+        self.transcribe_download_button = QPushButton("Download")
+        self.transcribe_download_button.setObjectName("secondary-button")
+        self.transcribe_download_button.setFixedWidth(110)
+        self.transcribe_download_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.transcribe_download_button.clicked.connect(self._download_subtitle_model)
+        t_status_layout.addWidget(self.transcribe_status_label)
+        t_status_layout.addWidget(self.transcribe_download_button)
+        t_status_layout.addStretch()
+
         lang_label = QLabel("Language")
         lang_label.setObjectName("field-label")
         lang_label.setFixedWidth(160)
@@ -1084,8 +1103,9 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(model_label, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
         grid.addWidget(self.transcribe_model_combo, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-        grid.addWidget(lang_label, 1, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
-        grid.addWidget(self.transcribe_lang_combo, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(t_status_row, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(lang_label, 2, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.transcribe_lang_combo, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         options_layout.addLayout(grid)
         options_layout.addWidget(hint)
         layout.addWidget(options_card)
@@ -1734,22 +1754,37 @@ class MainWindow(QMainWindow):
 
     def _refresh_subtitle_model_status(self) -> None:
         size = self.subtitle_model_combo.currentText()
+        size_mb = MODEL_SIZES_MB.get(size, "?")
+
         if subtitles_mod.resolve_bundled_model(size):
-            self.subtitle_status_label.setText("\u2713 ready (bundled)")
-            self.subtitle_download_button.setVisible(False)
+            status_text = "✓ Ready (Bawaan Aplikasi)"
+            status_style = "color: #16A34A; font-weight: bold;"
+            show_download = False
         elif is_model_cached(size):
-            self.subtitle_status_label.setText("\u2713 ready")
-            self.subtitle_download_button.setVisible(False)
+            status_text = "✓ Ready (Tersimpan Offline)"
+            status_style = "color: #16A34A; font-weight: bold;"
+            show_download = False
         else:
-            size_mb = MODEL_SIZES_MB.get(size, "?")
-            self.subtitle_status_label.setText(
-                f"not downloaded (~{size_mb} MB)"
-            )
-            self.subtitle_download_button.setVisible(True)
-            self.subtitle_download_button.setEnabled(
-                not getattr(self, "_model_downloading", False)
-                and self._busy_owner is None
-            )
+            status_text = f"⚠️ Belum diunduh (~{size_mb} MB)"
+            status_style = "color: #D97706; font-weight: bold;"
+            show_download = True
+
+        for label in (
+            getattr(self, "subtitle_status_label", None),
+            getattr(self, "transcribe_status_label", None),
+        ):
+            if label is not None:
+                label.setText(status_text)
+                label.setStyleSheet(status_style)
+
+        is_busy = getattr(self, "_model_downloading", False) or (self._busy_owner is not None)
+        for btn in (
+            getattr(self, "subtitle_download_button", None),
+            getattr(self, "transcribe_download_button", None),
+        ):
+            if btn is not None:
+                btn.setVisible(show_download)
+                btn.setEnabled(not is_busy)
 
     def _download_subtitle_model(self) -> None:
         if getattr(self, "_model_downloading", False):
@@ -1757,19 +1792,25 @@ class MainWindow(QMainWindow):
         if self._busy_owner is not None:
             QMessageBox.information(
                 self, "Busy",
-                "Wait for the current job to finish before downloading a model."
+                "Harap tunggu hingga proses yang sedang berjalan selesai."
             )
             return
 
         size = self.subtitle_model_combo.currentText()
         self._model_downloading = True
-        self.subtitle_download_button.setEnabled(False)
+        for btn in (
+            getattr(self, "subtitle_download_button", None),
+            getattr(self, "transcribe_download_button", None),
+        ):
+            if btn is not None:
+                btn.setEnabled(False)
         self.compile_button.setEnabled(False)
         self.silence_button.setEnabled(False)
+        self.transcribe_button.setEnabled(False)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
         self.status_label.setStyleSheet("color: #2563EB;")
-        self.status_label.setText(f"Downloading model \"{size}\"...")
+        self.status_label.setText(f"Mengunduh model Whisper \"{size}\"...")
 
         self._model_dl_worker = ModelDownloadWorker(size)
         self._model_dl_worker.finished_ok.connect(self._on_model_downloaded)
@@ -1785,15 +1826,24 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.compile_button.setEnabled(True)
         self.silence_button.setEnabled(True)
+        self.transcribe_button.setEnabled(True)
 
         size = self.subtitle_model_combo.currentText()
         if ok:
-            self.append_log(f"Whisper model \"{size}\" downloaded.")
+            self.append_log(f"Model Whisper \"{size}\" berhasil diunduh dan terverifikasi.")
+            QMessageBox.information(
+                self, "Download Selesai",
+                f"Model Whisper \"{size}\" berhasil diunduh dan siap digunakan!"
+            )
         else:
             self.status_label.setStyleSheet("color: #DC2626;")
-            self.status_label.setText("Model download failed.")
+            self.status_label.setText("Gagal mengunduh model.")
             self.append_log(
-                f"Model download failed for \"{size}\": {message or 'cancelled'}"
+                f"Gagal mengunduh model \"{size}\": {message or 'dibatalkan'}"
+            )
+            QMessageBox.warning(
+                self, "Download Gagal",
+                f"Pengunduhan model \"{size}\" gagal:\n{message or 'Terputus'}"
             )
         self._restore_status_label()
         self._refresh_subtitle_model_status()
@@ -2238,6 +2288,23 @@ class MainWindow(QMainWindow):
             "language": self.subtitle_lang_combo.currentText(),
         }
 
+        if subtitle_config["enabled"]:
+            model_size = subtitle_config["model"]
+            if not is_model_cached(model_size):
+                size_mb = MODEL_SIZES_MB.get(model_size, "?")
+                reply = QMessageBox.question(
+                    self,
+                    "Download Model Required",
+                    f"Model Whisper \"{model_size}\" belum tersimpan di komputer Anda (~{size_mb} MB).\n\n"
+                    f"Model ini perlu diunduh 1x agar pembuatan subtitle dapat berjalan.\n\n"
+                    f"Apakah Anda ingin mengunduhnya sekarang?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._download_subtitle_model()
+                return
+
         self.append_log("Starting silence removal...")
         self.silence_removal_requested.emit(
             file_path, output_folder, encoder, threshold_db,
@@ -2278,6 +2345,21 @@ class MainWindow(QMainWindow):
 
         model_size = self.transcribe_model_combo.currentText()
         language = self.transcribe_lang_combo.currentText()
+
+        if not is_model_cached(model_size):
+            size_mb = MODEL_SIZES_MB.get(model_size, "?")
+            reply = QMessageBox.question(
+                self,
+                "Download Model Required",
+                f"Model Whisper \"{model_size}\" belum tersimpan di komputer Anda (~{size_mb} MB).\n\n"
+                f"Model ini perlu diunduh 1x agar transkripsi audio dapat berjalan.\n\n"
+                f"Apakah Anda ingin mengunduhnya sekarang?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._download_subtitle_model()
+            return
 
         self.transcribe_button.setEnabled(False)
         self.transcribe_button.setText("Transcribing...")
