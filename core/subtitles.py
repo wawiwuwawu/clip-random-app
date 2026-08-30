@@ -165,7 +165,7 @@ def download_model(
     cancel_check=None,
 ) -> bool:
     """
-    Fetch the HF snapshot for *model_size* into local cache with SSL patch & retries.
+    Fetch the HF snapshot for *model_size* into local cache with SSL patch, 8 workers & retries.
 
     ``progress_cb(-1)`` signals an indeterminate download; ``1.0`` fires on
     completion. Returns True when a local snapshot path is available.
@@ -189,7 +189,11 @@ def download_model(
         if cancel_check and cancel_check():
             return False
         try:
-            path = snapshot_download(repo_id=repo, max_workers=2)
+            path = snapshot_download(
+                repo_id=repo,
+                max_workers=8,
+                etag_timeout=30,
+            )
             if path and _model_cached(model_size):
                 progress_cb(1.0)
                 return True
