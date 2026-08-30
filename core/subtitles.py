@@ -189,16 +189,24 @@ def download_model(
         if cancel_check and cancel_check():
             return False
         try:
-            path = snapshot_download(repo_id=repo)
+            path = snapshot_download(repo_id=repo, max_workers=2)
             if path and _model_cached(model_size):
                 progress_cb(1.0)
                 return True
         except Exception as exc:
             last_error = exc
 
-    _purge_model_cache(model_size)
+    model_bin = _find_cached_model_bin(model_size)
+    if model_bin and model_bin.is_file():
+        cur_mb = int(model_bin.stat().st_size / (1024 * 1024))
+        tot_mb = MODEL_SIZES_MB.get(model_size, "?")
+        raise RuntimeError(
+            f"Unduhan model \"{model_size}\" terputus ({cur_mb} MB / ~{tot_mb} MB). "
+            f"Silakan klik 'Download' kembali untuk melanjutkan sisa unduhan."
+        )
+
     raise RuntimeError(
-        f"Gagal mengunduh model Whisper \"{model_size}\" setelah 3x percobaan: {last_error}"
+        f"Gagal mengunduh model Whisper \"{model_size}\": {last_error or 'Koneksi terputus'}"
     )
 
 
@@ -255,7 +263,7 @@ def _load_model(
 
 
 def _model_cached(model_size: str) -> bool:
-    """True when the HF snapshot for this model exists AND contains valid model.bin."""
+    """Pure query check: True when local HF snapshot contains complete model.bin."""
     bundled = resolve_bundled_model(model_size)
     if bundled:
         bin_file = Path(bundled) / "model.bin"
@@ -281,10 +289,6 @@ def _model_cached(model_size: str) -> bool:
     model_bin = _find_cached_model_bin(model_size)
     if model_bin and model_bin.stat().st_size >= min_bytes:
         return True
-
-    # 3. Truncated/corrupted file cleanup
-    if model_bin and model_bin.stat().st_size < min_bytes:
-        _purge_model_cache(model_size)
 
     return False
 

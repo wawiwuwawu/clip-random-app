@@ -3,13 +3,14 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 fw_hiddenimports = (
-    ['faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub']
+    ['faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub', 'certifi']
     + collect_submodules('faster_whisper')
 )
 fw_datas = (
     collect_data_files('faster_whisper')
     + collect_data_files('tokenizers')
     + collect_data_files('huggingface_hub')
+    + collect_data_files('certifi')
 )
 
 
