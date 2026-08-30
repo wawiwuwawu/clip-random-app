@@ -23,6 +23,25 @@ os.environ.setdefault(
         / "SmartVideoCompiler" / "hf"),
 )
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+
+def patch_ssl_windows() -> bool:
+    """Bypass corrupt Windows Certificate Store using certifi's CA bundle for SSL downloads."""
+    try:
+        import ssl
+        import urllib.request
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        handler = urllib.request.HTTPSHandler(context=ctx)
+        urllib.request.install_opener(urllib.request.build_opener(handler))
+        return True
+    except Exception:
+        return False
+
+
+patch_ssl_windows()
 
 SUPPORTED_LANGUAGES = {
     "Auto-detect": None,
@@ -121,17 +140,37 @@ def is_model_cached(model_size: str) -> bool:
     return _model_cached(model_size)
 
 
+def _find_cached_model_bin(model_size: str) -> Path | None:
+    """Find local model.bin file in HF cache directory if present."""
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        return None
+    cache_root = Path(hf_home) / "hub"
+    folder_name = f"models--{_MODEL_REPO_PREFIX.replace('/', '--')}{model_size}"
+    target = cache_root / folder_name
+    if not target.exists():
+        return None
+    try:
+        for model_bin in target.glob("**/model.bin"):
+            if model_bin.is_file():
+                return model_bin
+    except Exception:
+        pass
+    return None
+
+
 def download_model(
     model_size: str,
     progress_cb=None,
     cancel_check=None,
 ) -> bool:
     """
-    Fetch the HF snapshot for *model_size* into the local cache.
+    Fetch the HF snapshot for *model_size* into local cache with SSL patch & retries.
 
     ``progress_cb(-1)`` signals an indeterminate download; ``1.0`` fires on
     completion. Returns True when a local snapshot path is available.
     """
+    patch_ssl_windows()
     repo = _MODEL_REPO_PREFIX + model_size
     progress_cb = progress_cb or (lambda fraction: None)
 
@@ -144,20 +183,23 @@ def download_model(
         return False
 
     progress_cb(-1)
-    try:
-        path = snapshot_download(repo_id=repo)
-    except Exception as exc:
-        _purge_model_cache(model_size)
-        raise RuntimeError(f"Gagal mengunduh model Whisper \"{model_size}\": {exc}") from exc
+    last_error = None
 
-    progress_cb(1.0)
+    for attempt in range(1, 4):
+        if cancel_check and cancel_check():
+            return False
+        try:
+            path = snapshot_download(repo_id=repo)
+            if path and _model_cached(model_size):
+                progress_cb(1.0)
+                return True
+        except Exception as exc:
+            last_error = exc
 
-    if not _model_cached(model_size):
-        _purge_model_cache(model_size)
-        raise RuntimeError(
-            f"Model Whisper \"{model_size}\" terunduh tetapi file tidak lengkap (model.bin terputus)."
-        )
-    return True
+    _purge_model_cache(model_size)
+    raise RuntimeError(
+        f"Gagal mengunduh model Whisper \"{model_size}\" setelah 3x percobaan: {last_error}"
+    )
 
 
 def _load_model(
@@ -220,6 +262,9 @@ def _model_cached(model_size: str) -> bool:
         if bin_file.is_file() and bin_file.stat().st_size > 1024 * 1024:
             return True
 
+    min_bytes = MODEL_MIN_BYTES.get(model_size, 10 * 1024 * 1024)
+
+    # 1. Try huggingface_hub snapshot_download with local_files_only
     try:
         from huggingface_hub import snapshot_download
         path = snapshot_download(
@@ -227,15 +272,21 @@ def _model_cached(model_size: str) -> bool:
             local_files_only=True,
         )
         model_file = Path(path) / "model.bin"
-        min_bytes = MODEL_MIN_BYTES.get(model_size, 10 * 1024 * 1024)
         if model_file.is_file() and model_file.stat().st_size >= min_bytes:
             return True
-
-        # Incomplete or truncated download — purge so fresh download can start
-        _purge_model_cache(model_size)
-        return False
     except Exception:
-        return False
+        pass
+
+    # 2. Direct filesystem fallback check for Windows cache/symlink quirks
+    model_bin = _find_cached_model_bin(model_size)
+    if model_bin and model_bin.stat().st_size >= min_bytes:
+        return True
+
+    # 3. Truncated/corrupted file cleanup
+    if model_bin and model_bin.stat().st_size < min_bytes:
+        _purge_model_cache(model_size)
+
+    return False
 
 
 def transcribe(
